@@ -34,62 +34,113 @@ dynamo.config.recompile_limit = 64
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
-
+def is_compute_capability_90_or_newer():
+    """Проверяет, поддерживает ли GPU compute capability 9.0 или новее"""
+    if not torch.cuda.is_available():
+        return False
+    
+    major, minor = torch.cuda.get_device_capability()
+    # Compute capability представляется как (major, minor)
+    # 9.0 = (9, 0), 8.0 = (8, 0), 7.0 = (7, 0) и т.д.
+    return major >= 9
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
-        out = torch._scaled_mm(
-            x_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-        return out, x_f8, w_f8
+    if is_compute_capability_90_or_newer():
+        @torch.compile
+        def impl(x: Tensor, w: Tensor):
+            assert x.is_contiguous() and w.is_contiguous()
+            x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+            w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+            out = torch._scaled_mm(
+                x_f8,
+                w_f8.T,
+                out_dtype=torch.bfloat16,
+                scale_a=x.new_tensor(x_s, dtype=torch.float32),
+                scale_b=x.new_tensor(w_s, dtype=torch.float32),
+                use_fast_accum=True,
+            )
+            print('out', out.shape, out.dtype, 'x_f8', x_f8.shape, x_f8.dtype, 'w_f8', w_f8.shape, w_f8.dtype)
+            return out, x_f8, w_f8
+    else:
+        @torch.compile
+        def impl(x: Tensor, w: Tensor):
+            assert x.is_contiguous() and w.is_contiguous()
+            
+            # Работаем напрямую в bfloat16 без FP8
+            x_scaled = (x / x_s).to(torch.bfloat16)
+            w_scaled = (w / w_s).to(torch.bfloat16)
+            
+            out = torch.matmul(x_scaled, w_scaled.T) * (x_s * w_s)
 
+            return out, x_scaled.to(torch.float8_e5m2), w_scaled.to(torch.float8_e5m2)
+        
     return impl(x, w)
 
 @mm_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
+def _(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float):
     assert x.ndim == w.ndim == 2
     assert x.shape[1] == w.shape[1]
     assert x.device == w.device
     assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
-
+    
+    # Базовый результат без масштабирования (как в оригинале)
+    out = x @ w.T
+    
+    # Возвращаем в формате соответствующем выбранной реализации
+    if is_compute_capability_90_or_newer():
+        return out, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    else:
+        return out, x.to(torch.bfloat16), w.to(torch.bfloat16)
+    
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
-            use_fast_accum=False,
-        )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
-            use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
+    if is_compute_capability_90_or_newer():
+        @torch.compile
+        def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+            assert grad.is_contiguous()
+            x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+            w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
+            grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+            grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+            grad_x = torch._scaled_mm(
+                grad_f8,
+                w_f8.T.contiguous().T,
+                out_dtype=torch.bfloat16,
+                scale_a=grad_inv_s,
+                scale_b=w_inv_s,
+                use_fast_accum=False,
+            )
+            # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+            grad_w = torch._scaled_mm(
+                x_f8.T.contiguous(),
+                grad_f8.T.contiguous().T,
+                out_dtype=torch.float32,
+                scale_a=x_inv_s,
+                scale_b=grad_inv_s,
+                use_fast_accum=False,
+            ).T
+            return grad_x, grad_w
+    else:
+        @torch.compile
+        def impl(grad: torch.Tensor, x_f8: torch.Tensor, w_f8: torch.Tensor):
+            assert grad.is_contiguous()
+            x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+            w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
+            grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+            
+            # Преобразуем FP8 в FP16 или FP32 перед вычислениями
+            grad_fp16 = grad.div(grad_s).to(torch.bfloat16)
+            x_fp16 = x_f8.to(torch.bfloat16)
+            w_fp16 = w_f8.to(torch.bfloat16)
+            
+            # grad_x = torch.mm(grad_fp16, w_fp16) * grad_inv_s * w_inv_s  # (8192, 50304) @ (50304, 768) = (8192, 768)
+            grad_x = torch.mm(grad_fp16, w_fp16) * grad_inv_s * w_inv_s
+            
+            # grad_w = torch.mm(x_fp16.T, grad_fp16.T) * x_inv_s * grad_inv_s  # (768, 8192) @ (50304, 8192).T = (768, 8192) @ (8192, 50304) = (768, 50304)
+            grad_w = torch.mm(x_fp16.T, grad_fp16) * x_inv_s * grad_inv_s  # (768, 50304)
+            grad_w = grad_w.T  # (50304, 768)
+            
+            return grad_x.to(torch.bfloat16), grad_w.to(torch.float32)
     return impl(g, x_f8, w_f8)
 
 @mm_backward_op.register_fake
@@ -857,8 +908,14 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-
+# Optional use FlashAttantion 2 if FA3 didn't allowed
+if is_compute_capability_90_or_newer():
+    flash_attn_varlen_func = get_kernel('varunneal/flash-attention-3').flash_attn_interface.flash_attn_varlen_func
+else:
+    print('FlashAttention 3 is not available, use flash_attn.flash_attn_interface.flash_attn_varlen_func instead')
+    import flash_attn
+    flash_attn_varlen_func = flash_attn.flash_attn_interface.flash_attn_varlen_func
+    
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
@@ -906,7 +963,7 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
+        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
                                    causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
@@ -1258,9 +1315,9 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 16 * 8
+    train_batch_size: int = 2048 * 16 * 1 # *8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 //4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1278,17 +1335,55 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+# Внешний конфигуратор для бедных, придуманный для запуска в обход torchrun, в частности через него можно снижать batch_size
+import sys
+from ast import literal_eval
+for arg in sys.argv[1:]:
+    if ('=' in arg) and ('--' in arg): # assume it's a --key=value argument
+        key, val = arg.split('=')
+        key = key[2:]
+        try:
+            attempt = literal_eval(val) # attempt to eval it it (e.g. if bool, number, or etc)
+        except (SyntaxError, ValueError):
+            attempt = val # if that goes wrong, just use the string
+        if hasattr(args, key):
+            # ensure the types match ok
+            assert type(attempt) == type(getattr(args,key))
+            # cross fingers
+            print(f"Overriding: args.{key} = {attempt}")
+            setattr(args,key,attempt)
+            pass
+        elif key in globals():
+            try:
+                # attempt to eval it it (e.g. if bool, number, or etc)
+                attempt = literal_eval(val)
+            except (SyntaxError, ValueError):
+                # if that goes wrong, just use the string
+                attempt = val
+            # ensure the types match ok
+            assert type(attempt) == type(globals()[key])
+            # cross fingers
+            print(f"Overriding: globals.{key} = {attempt}")
+            globals()[key] = attempt
+        else:
+            print(f"Set: args.{key} = {attempt}")
+            setattr(args,key,attempt)
+            print(f"Set: globals.{key} = {attempt}")
+            globals()[key] = attempt
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
 
 # torchrun sets these env variables
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
+os.environ.setdefault("MASTER_ADDR","127.0.0.1") # Чтобы скрипт можно было запустить напосредственно из отладчика
+os.environ.setdefault("MASTER_PORT","29500")
+rank = int(os.environ.setdefault("RANK",'0'))
+world_size = int(os.environ.setdefault("WORLD_SIZE",'1'))
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
 grad_accum_steps = 8 // world_size
 assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+device = torch.device("cuda", int(os.environ.setdefault("LOCAL_RANK",'0')))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
@@ -1327,9 +1422,11 @@ model: nn.Module = GPT(
     num_layers=12,
     num_heads=6,
     head_dim=128,
-    model_dim=768,
+    model_dim=128*6, # Assertion: num_heads * head_dim must equal model_dim
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
+print0(f'Model params{sum([p.numel() for p in model.parameters()]):,}:\n{model}')
+
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
@@ -1414,7 +1511,7 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 ########################################
 #            Warmup kernels            #
@@ -1478,10 +1575,13 @@ for step in range(train_steps + 1):
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
+        t1 = time.perf_counter()
         with torch.no_grad():
-            for _ in range(val_steps):
+            for val_i in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
+                if val_i % 100 == 0:
+                    print0(f'val progress: {val_i+1}/{val_steps} spends:{time.perf_counter() - t1}s', console=True)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
