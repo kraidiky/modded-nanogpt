@@ -1511,7 +1511,7 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 ########################################
 #            Warmup kernels            #
