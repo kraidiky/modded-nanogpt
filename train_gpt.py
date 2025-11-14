@@ -8,6 +8,7 @@ import glob
 import math
 import threading
 import time
+from datetime import datetime
 import uuid
 from dataclasses import dataclass
 from itertools import accumulate
@@ -1315,16 +1316,17 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_accumulate = 8
     train_batch_size: int = 2048 * 16 * 1 # *8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 //4 # *8
     # optimization
-    num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 8275#2275  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
@@ -1332,44 +1334,46 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+@dataclass
+class Modelparameters:
+    #data
+    vocab_size=50257
+    num_layers=12
+    num_heads=6
+    head_dim=128
 
 args = Hyperparameters()
+model_args = Modelparameters()
 
 # Внешний конфигуратор для бедных, придуманный для запуска в обход torchrun, в частности через него можно снижать batch_size
 import sys
 from ast import literal_eval
-for arg in sys.argv[1:]:
-    if ('=' in arg) and ('--' in arg): # assume it's a --key=value argument
-        key, val = arg.split('=')
-        key = key[2:]
-        try:
-            attempt = literal_eval(val) # attempt to eval it it (e.g. if bool, number, or etc)
-        except (SyntaxError, ValueError):
-            attempt = val # if that goes wrong, just use the string
-        if hasattr(args, key):
-            # ensure the types match ok
-            assert type(attempt) == type(getattr(args,key))
-            # cross fingers
-            print(f"Overriding: args.{key} = {attempt}")
-            setattr(args,key,attempt)
-            pass
-        elif key in globals():
+def configurator_for_poor_peoples(target):
+    for arg in sys.argv[1:]:
+        if ('=' in arg) and ('--' in arg): # assume it's a --key=value argument
+            key, val = arg.split('=')
+            key = key[2:]
             try:
-                # attempt to eval it it (e.g. if bool, number, or etc)
-                attempt = literal_eval(val)
+                attempt = literal_eval(val) # attempt to eval it it (e.g. if bool, number, or etc)
             except (SyntaxError, ValueError):
-                # if that goes wrong, just use the string
-                attempt = val
-            # ensure the types match ok
-            assert type(attempt) == type(globals()[key])
-            # cross fingers
-            print(f"Overriding: globals.{key} = {attempt}")
-            globals()[key] = attempt
-        else:
-            print(f"Set: args.{key} = {attempt}")
-            setattr(args,key,attempt)
-            print(f"Set: globals.{key} = {attempt}")
-            globals()[key] = attempt
+                attempt = val # if that goes wrong, just use the string
+            if isinstance(target, dict):
+                target:dict = target
+                if key in target:
+                    assert type(attempt) == type(target[key]) # ensure the types match ok
+                    print(f"Overriding: [{key}] = {attempt}")
+                    target[key]=attempt
+                    pass
+            else:
+                if hasattr(target, key):
+                    assert type(attempt) == type(getattr(args,key)) # ensure the types match ok
+                    print(f"Overriding: {key} = {attempt}")
+                    setattr(target,key,attempt)
+                    pass
+
+configurator_for_poor_peoples(args)
+configurator_for_poor_peoples(model_args)
+configurator_for_poor_peoples(globals())
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1418,11 +1422,11 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=50257,
-    num_layers=12,
-    num_heads=6,
-    head_dim=128,
-    model_dim=128*6, # Assertion: num_heads * head_dim must equal model_dim
+    vocab_size=model_args.vocab_size,
+    num_layers=model_args.num_layers,
+    num_heads=model_args.num_heads,
+    head_dim=model_args.head_dim,
+    model_dim=model_args.head_dim*model_args.num_heads, # Assertion: num_heads * head_dim must equal model_dim
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
 print0(f'Model params{sum([p.numel() for p in model.parameters()]):,}:\n{model}')
