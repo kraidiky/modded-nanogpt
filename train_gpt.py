@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -30,7 +31,24 @@ import triton.language as tl
 from kernels import get_kernel
 from torch import Tensor, nn
 
+import kraidiky.history as h
+
 dynamo.config.recompile_limit = 64
+
+# simple time tools
+def time_to_str(value:float):
+    if value < 0.5:
+        return f"{value*1000:.3f}:ms";
+    t = []
+    value = round(value)
+    if value > 0: t.append(value%60); value = value//60
+    if value > 0: t.append(value%60); value = value//60
+    if value > 0: t.append(value%24); value = value//24
+    if value > 0: t.append(value);
+    t = [f'{v:02}{e}' for v,e in zip(t,['s','m','h','d'])]
+    return ':'.join(t[-2:][::-1])
+def time_to_progress(elapsed:float, current:int, total:int):
+    return f"{time_to_str(elapsed)}/{time_to_str(elapsed*total/current)}"    
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -1316,13 +1334,12 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_accumulate = 8
     train_batch_size: int = 2048 * 16 * 1 # *8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 //4 # *8
     # optimization
-    num_scheduled_iterations: int = 8275#2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40 # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
@@ -1337,10 +1354,10 @@ class Hyperparameters:
 @dataclass
 class Modelparameters:
     #data
-    vocab_size=50257
-    num_layers=12
-    num_heads=6
-    head_dim=128
+    vocab_size:int=50257
+    num_layers:int=12
+    num_heads:int=6
+    head_dim:int=128
 
 args = Hyperparameters()
 model_args = Modelparameters()
@@ -1376,8 +1393,8 @@ configurator_for_poor_peoples(model_args)
 configurator_for_poor_peoples(globals())
 
 data_path = os.environ.get("DATA_PATH", ".")
-args.train_files = os.path.join(data_path, args.train_files)
-args.val_files = os.path.join(data_path, args.val_files)
+train_files = os.path.join(data_path, args.train_files)
+val_files = os.path.join(data_path, args.val_files)
 
 # torchrun sets these env variables
 os.environ.setdefault("MASTER_ADDR","127.0.0.1") # Чтобы скрипт можно было запустить напосредственно из отладчика
@@ -1392,6 +1409,15 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+history = h.empty() if master_process else None
+history and h.capture_config(history, 0, hiperparameters = args)
+history and h.capture_config(history, 0, model_params = model_args)
+history and h.capture_config(history, 0, torchrun = SimpleNamespace(
+    MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
+    RANK=os.environ.get("RANK"), WORLD_SIZE=os.environ.get("WORLD_SIZE"),
+    LOCAL_RANK=os.environ.get("LOCAL_RANK"),
+    DISABLE_FP8=os.environ.get("DISABLE_FP8")))
 
 # begin logging
 logfile = None
@@ -1421,6 +1447,7 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+start_step = 0
 model: nn.Module = GPT(
     vocab_size=model_args.vocab_size,
     num_layers=model_args.num_layers,
@@ -1429,11 +1456,22 @@ model: nn.Module = GPT(
     model_dim=model_args.head_dim*model_args.num_heads, # Assertion: num_heads * head_dim must equal model_dim
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
-print0(f'Model params{sum([p.numel() for p in model.parameters()]):,}:\n{model}')
 
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
+print0(f'Model params{sum([p.numel() for p in model.parameters()]):,}:\n{model}')
+
+history and h.capture_config(history, start_step, hiperparameters = args)
+history and h.capture_config(history, start_step, model_params = model_args)
+history and h.capture_config(history, start_step, torchrun = SimpleNamespace(
+    MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
+    RANK=os.environ.get("RANK"), WORLD_SIZE=os.environ.get("WORLD_SIZE"),
+    LOCAL_RANK=os.environ.get("LOCAL_RANK"),
+    DISABLE_FP8=os.environ.get("DISABLE_FP8")))
+history and h.capture_model_state(history, model, start_step)        
+        
+        
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1525,7 +1563,8 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+t0 = time.perf_counter()
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
     # each window size is a new graph, need to warm up each with Yarn.attn_scale
@@ -1542,6 +1581,8 @@ for step in range(warmup_steps):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if (step%10 == 0) or (step+1 == warmup_steps):
+        print0(f'warmap:{step+1}/{warmup_steps} time:{time_to_progress(time.perf_counter()-t0, step+1, warmup_steps)}', console = True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
@@ -1552,7 +1593,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = distributed_data_generator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -1560,8 +1601,8 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
+for step in range(start_step, start_step + train_steps + 1):
+    last_step = (step == start_step + train_steps)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
@@ -1577,19 +1618,21 @@ for step in range(train_steps + 1):
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        val_loader = distributed_data_generator(val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
         t1 = time.perf_counter()
         with torch.no_grad():
             for val_i in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
-                if val_i % 100 == 0:
-                    print0(f'val progress: {val_i+1}/{val_steps} spends:{time.perf_counter() - t1}s', console=True)
+                if (val_i % 200 == 0) or (val_i+1 == val_steps):
+                    print0(f'val progress: {val_i+1}/{val_steps} spends:{time_to_progress(time.perf_counter() - t1,val_i+1,val_steps)} val_loss:{val_loss/(val_i+1):.4f}', console=True)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step+1):.2f}ms", console=True)
+        history and h.loss_val(history).append((step,val_loss.item()))
+        history and h.capture_model_state(history, model, start_step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1602,16 +1645,27 @@ for step in range(train_steps + 1):
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
+    if master_process:
+        log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        os.makedirs(f"logs/{run_id}", exist_ok=True)
+        torch.save(history, f"logs/{run_id}/last_history.pt")
+        torch.save(log, f"logs/{run_id}/last_model.pt")
+        
 
     # --------------- TRAINING SECTION -----------------
+    train_losses = []
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+        train_loss = model(inputs, targets, cum_seqlens, ws_short, ws_long)
+        train_loss.backward()
+        train_losses.append((train_loss.detach()/targets.size(0)).item())
+        del train_loss
+    history and h.loss_train(history).append((step, sum(train_losses)/len(train_losses)))
     step_optimizers(step, optimizers, model)
      
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
