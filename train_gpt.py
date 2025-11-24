@@ -1,6 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from collections import OrderedDict, defaultdict
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -78,7 +79,7 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
                 scale_b=x.new_tensor(w_s, dtype=torch.float32),
                 use_fast_accum=True,
             )
-            print('out', out.shape, out.dtype, 'x_f8', x_f8.shape, x_f8.dtype, 'w_f8', w_f8.shape, w_f8.dtype)
+            #print('out', out.shape, out.dtype, 'x_f8', x_f8.shape, x_f8.dtype, 'w_f8', w_f8.shape, w_f8.dtype)
             return out, x_f8, w_f8
     else:
         @torch.compile
@@ -1327,6 +1328,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
 # -----------------------------------------------------------------------------
 # int main
+resume = ''
 
 @dataclass
 class Hyperparameters:
@@ -1339,7 +1341,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 //4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40 # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 40000 # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
@@ -1367,9 +1369,9 @@ import sys
 from ast import literal_eval
 def configurator_for_poor_peoples(target):
     for arg in sys.argv[1:]:
-        if ('=' in arg) and ('--' in arg): # assume it's a --key=value argument
+        if ('=' in arg): # key=value argument # and ('--' in arg): # assume it's a --key=value argument
             key, val = arg.split('=')
-            key = key[2:]
+            key = key[2:] if key[:2] == '--' else key
             try:
                 attempt = literal_eval(val) # attempt to eval it it (e.g. if bool, number, or etc)
             except (SyntaxError, ValueError):
@@ -1378,13 +1380,13 @@ def configurator_for_poor_peoples(target):
                 target:dict = target
                 if key in target:
                     assert type(attempt) == type(target[key]) # ensure the types match ok
-                    print(f"Overriding: [{key}] = {attempt}")
+                    print(f"Overriding: [{key}] = {attempt} # old value {target[key]}")
                     target[key]=attempt
                     pass
             else:
                 if hasattr(target, key):
                     assert type(attempt) == type(getattr(args,key)) # ensure the types match ok
-                    print(f"Overriding: {key} = {attempt}")
+                    print(f"Overriding: {key} = {attempt} # old value: {getattr(args,key)}")
                     setattr(target,key,attempt)
                     pass
 
@@ -1447,6 +1449,64 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+def data_info(target):
+    if isinstance(target,(dict,defaultdict)):
+        return {key:data_info(value) for key,value in target.items()}
+    if isinstance(target, list):
+        return [data_info(child) for child in target]
+    if isinstance(target, torch.Tensor):
+        cpu = torch.device('cpu')
+        return (target.shape, target.dtype) if target.device == cpu else (target.shape, target.dtype, f'{target.device.type}:{target.device.index}')
+    return target
+
+# Чекпоинтам не место в видеопамяти, у нас её и так мало
+def SaveModelCheckpoint(model:torch.nn.Module):
+    return {k:v.cpu().detach() for k,v in model.state_dict()}
+def SaveOptimizersMemCheckpoint() -> list[dict]:
+    state = [opt.state_dict() for opt in optimizers]
+    for opt in state:
+        for part in opt['state'].values():
+            for key in list(part.keys()):
+                if isinstance(part[key], torch.Tensor):
+                    part[key] = part[key].cpu()
+    return state
+# Надо проверить в какой памяти в итоге окажутся те тензоры, которые я буду не руками переносить
+def LoadOptimizersMemCheckpoint(state_dict_list:list[dict]):
+    for opt,state_dict in zip(optimizers, state_dict_list):
+        opt:torch.optim.Optimizer=opt
+        opt.load_state_dict(state_dict)  # TODO а это надо ли раздовать? На warmup наверное не надо полагаться?
+    # Костыль для оптимизатора NorMuon, который в стейте хранит тензоры разных типов, а load_state_dict приводит их к типу параметра
+    param_list = [] # Собираем маппинг: индекс_параметра → сам Parameter
+    for group in opt.param_groups:
+        param_list.extend(group['params']) # Теперь param_list[i] — это i-й параметр (тот, что соответствует state_dict['state'][i])
+    for param_idx, param_state_in_dict in state_dict_list[1]['state'].items(): # Обходим все записи в оригинальном хранилище
+        if 'second_momentum_buffer' in param_state_in_dict: # Получаем соответствующий Parameter
+            p = param_list[param_idx]
+            current_state = opt.state[p if p in opt.state else id(p)]
+            old = param_state_in_dict['second_momentum_buffer']
+            current = current_state['second_momentum_buffer']
+            if old.dtype != current.dtype:
+                current_state['second_momentum_buffer'] = old.clone().to(current.device) # Чтобвы типы, и соответственно точность не портить
+
+def SaveStateToFile(prefix:str):
+    # Оставляю запись в точности такой, какой она была в оригинальном файлк, для совместимости
+    os.makedirs(f"logs/{run_id}", exist_ok=True)
+    torch.save(history, f"logs/{run_id}/{prefix}_history.pt")
+    torch.save(dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]), f"logs/{run_id}/{prefix}_model.pt") 
+
+def LoadStateFromFile(path:str):
+    global step, history
+    loaded_state = torch.load(path)
+    step = loaded_state['step']
+    # Возможно надо привести заголовки к другому формату, потому что иногда сохраняется компилированная модель, а иногда оригинальная. '_orig_mod.scalars' вместо 'scalars'
+    assert all([(p1.shape==p2.shape) and (n2.endswith(n1) or n1.endswith(n2)) for (n1,p1),(n2,p2) in zip(loaded_state['model'].items(), model.named_parameters())])
+    model_state_dictionary = OrderedDict(**{n2:p1 for (n1,p1),(n2,p2) in zip(loaded_state['model'].items(), model.named_parameters())})
+    model.load_state_dict(model_state_dictionary) # TODO и раздать через dist
+    LoadOptimizersMemCheckpoint(loaded_state['optimizers'])
+    history_path = path.replace("_model.pt", "_history.pt")
+    if os.path.exists(history_path):
+        history = torch.load(history_path)
+
 start_step = 0
 model: nn.Module = GPT(
     vocab_size=model_args.vocab_size,
@@ -1462,16 +1522,6 @@ for m in model.modules():
         m.bfloat16()
 print0(f'Model params{sum([p.numel() for p in model.parameters()]):,}:\n{model}')
 
-history and h.capture_config(history, start_step, hiperparameters = args)
-history and h.capture_config(history, start_step, model_params = model_args)
-history and h.capture_config(history, start_step, torchrun = SimpleNamespace(
-    MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
-    RANK=os.environ.get("RANK"), WORLD_SIZE=os.environ.get("WORLD_SIZE"),
-    LOCAL_RANK=os.environ.get("LOCAL_RANK"),
-    DISABLE_FP8=os.environ.get("DISABLE_FP8")))
-history and h.capture_model_state(history, model, start_step)        
-        
-        
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1497,6 +1547,21 @@ optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+if (resume != '') and (resume is not None) and True: # Загрузка состояния
+    print0(f'RESUME: {resume}', console=True)
+    LoadStateFromFile(resume)
+    start_step = step-1
+
+history and h.capture_config(history, start_step, hiperparameters = args)
+history and h.capture_config(history, start_step, model_params = model_args)
+history and h.capture_config(history, start_step, torchrun = SimpleNamespace(
+    MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
+    RANK=os.environ.get("RANK"), WORLD_SIZE=os.environ.get("WORLD_SIZE"),
+    LOCAL_RANK=os.environ.get("LOCAL_RANK"),
+    DISABLE_FP8=os.environ.get("DISABLE_FP8")))
+history and h.capture_model_state(history, model, start_step)
+
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
@@ -1560,7 +1625,7 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 30
+warmup_steps = 2
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
@@ -1585,8 +1650,7 @@ for step in range(warmup_steps):
         print0(f'warmap:{step+1}/{warmup_steps} time:{time_to_progress(time.perf_counter()-t0, step+1, warmup_steps)}', console = True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
+LoadOptimizersMemCheckpoint(initial_state["optimizers"])
 del train_loader, initial_state
 
 ########################################
@@ -1638,18 +1702,10 @@ for step in range(start_step, start_step + train_steps + 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
     if master_process:
-        log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        os.makedirs(f"logs/{run_id}", exist_ok=True)
-        torch.save(history, f"logs/{run_id}/last_history.pt")
-        torch.save(log, f"logs/{run_id}/last_model.pt")
+        if last_step or args.save_checkpoint:
+            SaveStateToFile(f"step{step:06d}.pt")
+        SaveStateToFile('last')
         
 
     # --------------- TRAINING SECTION -----------------
@@ -1662,7 +1718,7 @@ for step in range(start_step, start_step + train_steps + 1):
         del train_loss
     history and h.loss_train(history).append((step, sum(train_losses)/len(train_losses)))
     step_optimizers(step, optimizers, model)
-     
+    
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
