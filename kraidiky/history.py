@@ -12,14 +12,20 @@ keys = SimpleNamespace(loss='loss', train='train', val='val', lr='lr',
                        structure='structure', zeros='zeros', zeros_per_layer='zeros_per_layer',
                        )
 
-def get(target, name:str, default:Callable[[],Any]):
+def get(target, name:str, default:Callable[[],Any] = None):
     if isinstance(target, SimpleNamespace):
         if not hasattr(target, name):
-            setattr(target, name, default())
+            if default is not None:
+                setattr(target, name, default())
+            else:
+                raise Exception(f'There is not {name} at {set(dir(target))-set(dir(SimpleNamespace))}')
         return getattr(target, name)
     elif isinstance(target, dict):
         if name not in target:
-            target[name] = default()
+            if default is not None:
+                target[name] = default()
+            else:
+                raise Exception(f'There is not {name} at {target.keys()}')
         return target[name]
     else:
         raise Exception(f'Unexpected type: {type(target)}')

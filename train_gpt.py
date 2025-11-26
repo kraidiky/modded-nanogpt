@@ -1,6 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from typing import Iterator, Tuple
 from collections import OrderedDict, defaultdict
 
 with open(sys.argv[0]) as f:
@@ -1254,77 +1255,163 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
-    # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
-    num_tokens = num_tokens // grad_accum_steps
+class DistributedDataGenerator:
+    def __init__(
+        self,
+        filename_pattern: str,
+        num_tokens: int,
+        max_seq_len: int,
+        grad_accum_steps: int = 1,
+        align_to_bos: bool = True
+    ):
+        self.filename_pattern = filename_pattern
+        self.max_seq_len = max_seq_len
+        self.grad_accum_steps = grad_accum_steps
+        self.align_to_bos = align_to_bos
 
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    if not files:
-        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
-    tokens = _load_data_shard(next(file_iter))
-    if align_to_bos:
-        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
-        preloader = DataPreloader(file_iter, world_size)
-        preloader.start()
-    else:
-        pos = 0  # for unaligned case
+        self._total_tokens_per_step = num_tokens
+        assert num_tokens % (self.world_size * self.grad_accum_steps) == 0, \
+            "num_tokens must be divisible by world_size * grad_accum_steps"
+        self.num_tokens = num_tokens // self.grad_accum_steps
 
-    while True:
-        num_tokens_local = num_tokens // world_size
-        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
+        self.files = [Path(f) for f in sorted(glob.glob(self.filename_pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {self.filename_pattern}")
 
-        if align_to_bos:
-            try:
-                seq_starts, seq_ends = finder.next_batch(num_tokens_local, max_seq_len)
-                start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
-            except StopIteration:
-                # This shard is exhausted, load the next one in the next loop iteration.
-                tokens, finder = preloader.get()
-                preloader.start()
-                continue
+        # Internal cursor — сбрасывается при seek
+        self._current_file_idx = 0
+        self._tokens = None
+        self._finder = None
+        self._pos = 0  # for unaligned mode
+        self._microbatch_count = 0  # total yield count since last reset
 
-            buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
-            _inputs = buf[:-1]
-            _targets = buf[1:]
-            end_idxs[-1] -= 1  # last document was too long to account for _targets offset
-            cum_lengths = (end_idxs - start_idxs).cumsum(0)
+        # Загружаем первый шард
+        self._load_current_shard()
 
+    def _load_current_shard(self):
+        if self._current_file_idx >= len(self.files):
+            raise StopIteration("No more shards")
+
+        path = self.files[self._current_file_idx]
+        self._tokens = _load_data_shard(path)
+
+        if self.align_to_bos:
+            self._finder = BOSFinder(self._tokens, world_size=self.world_size, quickload=True)
+            self._finder.start()  # async load full BOS index if quickload
         else:
-            if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+            self._finder = None
 
-            pos_local = pos + rank * num_tokens_local
-            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
-            _inputs = buf[:-1].view(num_tokens_local, )
-            _targets = buf[1:].view(num_tokens_local, )
+    def _reset_to_start(self):
+        """Сбрасывает всё к началу первого шарда."""
+        self._current_file_idx = 0
+        self._pos = 0
+        self._microbatch_count = 0
+        self._load_current_shard()
 
-            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
-            pos += num_tokens
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        while True:
+            num_tokens_local = self.num_tokens // self.world_size
+            max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)
 
+            if self.align_to_bos:
+                # Wait for BOS index if still loading
+                if self._finder.thread is not None:
+                    self._finder.get()  # blocks until full index ready
 
-        _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
-        _cum_lengths[0] = 0
-        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+                try:
+                    seq_starts, seq_ends = self._finder.next_batch(num_tokens_local, self.max_seq_len)
+                except StopIteration:
+                    # Move to next shard
+                    self._current_file_idx += 1
+                    self._load_current_shard()
+                    continue
 
-        new_params = yield (
-            _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
-            _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
-            _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
-        )
+                start_idxs = torch.tensor(seq_starts[self.rank])
+                end_idxs = torch.tensor(seq_ends[self.rank])
 
-        if new_params is not None:
-            # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
-            new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
-            num_tokens = new_num_tokens
-            max_seq_len = new_max_seq_len
-            grad_accum_steps = new_grad_accum_steps
+                buf = torch.cat([self._tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+                _inputs = buf[:-1]
+                _targets = buf[1:]
+                end_idxs[-1] -= 1
+                cum_lengths = (end_idxs - start_idxs).cumsum(0)
 
+            else:
+                if self._pos + self.num_tokens + 1 >= len(self._tokens):
+                    self._current_file_idx += 1
+                    self._load_current_shard()
+                    self._pos = 0
+
+                pos_local = self._pos + self.rank * num_tokens_local
+                buf = self._tokens[pos_local: pos_local + num_tokens_local + 1]
+                _inputs = buf[:-1].view(num_tokens_local,)
+                _targets = buf[1:].view(num_tokens_local,)
+                cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+                self._pos += self.num_tokens
+
+            _cum_lengths = torch.full((max_num_docs,), num_tokens_local, dtype=torch.int32)
+            _cum_lengths[0] = 0
+            _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+
+            # Единственный yield
+            new_params = yield (
+                _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
+                _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
+                _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
+            )
+            self._microbatch_count += 1
+
+            if new_params is not None:
+                new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
+                assert new_num_tokens % (self.world_size * new_grad_accum_steps) == 0, \
+                    "new_num_tokens must be divisible by world_size * grad_accum_steps"
+                self._total_tokens_per_step = new_num_tokens
+                self.num_tokens = new_num_tokens // new_grad_accum_steps
+                self.max_seq_len = new_max_seq_len
+                self.grad_accum_steps = new_grad_accum_steps
+
+    def seek(self, step: int):
+        """
+        Перематывает генератор так, будто уже выполнено `step` шагов оптимизатора.
+        Поддерживает step < 0 (возврат к началу + промотка).
+        Работает путём полного сброса и последовательной прокрутки.
+        """
+        if step < 0:
+            raise ValueError("step must be >= 0 (training always starts from step 0)")
+
+        target_microbatch = step * self.grad_accum_steps
+
+        # Сбрасываем всё
+        self._reset_to_start()
+
+        # Проматываем вперёд target_microbatch микро-батчей
+        # (имитируем вызовы __iter__, но без yield)
+        microbatch_local = self.num_tokens // self.world_size
+
+        mb = 0
+        while mb < target_microbatch:
+            if self.align_to_bos:
+                try:
+                    # Имитируем next_batch, но не используем результат
+                    self._finder.next_batch(microbatch_local, self.max_seq_len)
+                    mb += 1
+                except StopIteration:
+                    self._current_file_idx += 1
+                    self._load_current_shard()
+                    # продолжаем
+            else:
+                # Просто сдвигаем _pos
+                if self._pos + self.num_tokens + 1 >= len(self._tokens):
+                    self._current_file_idx += 1
+                    self._load_current_shard()
+                    self._pos = 0
+                self._pos += self.num_tokens
+                mb += 1
+
+        # После seek — счётчик синхронизирован
+        self._microbatch_count = target_microbatch
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1491,8 +1578,13 @@ def LoadOptimizersMemCheckpoint(state_dict_list:list[dict]):
 def SaveStateToFile(prefix:str):
     # Оставляю запись в точности такой, какой она была в оригинальном файлк, для совместимости
     os.makedirs(f"logs/{run_id}", exist_ok=True)
-    torch.save(history, f"logs/{run_id}/{prefix}_history.pt")
-    torch.save(dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]), f"logs/{run_id}/{prefix}_model.pt") 
+    history_path = f"logs/{run_id}/{prefix}_history.pt"
+    model_path = f"logs/{run_id}/{prefix}_model.pt"
+    if os.path.exists(history_path): os.rename(history_path, f"{history_path}.bak")
+    if os.path.exists(model_path): os.rename(model_path, f"{model_path}.bak")    
+    # При такой схеме записи, кстати, не факт, что буфер успеет корректно записаться. Но так чуть понадёжнее...
+    torch.save(history, history_path)
+    torch.save(dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]), model_path)
 
 def LoadStateFromFile(path:str):
     global step, history
@@ -1551,7 +1643,7 @@ for opt in optimizers:
 if (resume != '') and (resume is not None) and True: # Загрузка состояния
     print0(f'RESUME: {resume}', console=True)
     LoadStateFromFile(resume)
-    start_step = step-1
+    start_step = step
 
 history and h.capture_config(history, start_step, hiperparameters = args)
 history and h.capture_config(history, start_step, model_params = model_args)
@@ -1625,10 +1717,10 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 2
+warmup_steps = 1
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader = iter(DistributedDataGenerator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps))
 t0 = time.perf_counter()
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
@@ -1657,7 +1749,9 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_dataloader = DistributedDataGenerator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+if start_step != 0: train_dataloader.seek(start_step)
+train_loader = iter(train_dataloader)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -1682,7 +1776,7 @@ for step in range(start_step, start_step + train_steps + 1):
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        val_loader = iter(DistributedDataGenerator(val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False))
         val_loss = 0
         t1 = time.perf_counter()
         with torch.no_grad():
@@ -1694,18 +1788,19 @@ for step in range(start_step, start_step + train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step+1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
         history and h.capture_model_state(history, model, start_step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        if master_process:
+            SaveStateToFile('last')
 
     if master_process:
         if last_step or args.save_checkpoint:
             SaveStateToFile(f"step{step:06d}.pt")
-        SaveStateToFile('last')
         
 
     # --------------- TRAINING SECTION -----------------
@@ -1721,7 +1816,7 @@ for step in range(start_step, start_step + train_steps + 1):
     
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step - start_step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
