@@ -1,7 +1,7 @@
 import os
 import sys
 from types import SimpleNamespace
-from typing import Iterator, Tuple
+from typing import Tuple, Optional
 from collections import OrderedDict, defaultdict
 
 with open(sys.argv[0]) as f:
@@ -1215,7 +1215,7 @@ class BOSFinder:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
+                    raise StopIteration(f"Insufficient BOS ahead of position {self.size}; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1281,6 +1281,11 @@ class DistributedDataGenerator:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {self.filename_pattern}")
 
+        # --- Новые поля для итератора и seek ---
+        self._shard_sizes_cache: Optional[list[int]] = None  # Размер каждого шарда
+        self._shard_batches_cache: Optional[list[int]] = None # Количество батчей в каждом шарде
+        # -----------------------
+
         # Internal cursor — сбрасывается при seek
         self._current_file_idx = 0
         self._tokens = None
@@ -1290,6 +1295,50 @@ class DistributedDataGenerator:
 
         # Загружаем первый шард
         self._load_current_shard()
+
+    def _get_shard_sizes_and_batches(self):
+        """Вычисляет и кэширует размеры шардов и количество батчей в каждом."""
+        if self._shard_sizes_cache is not None:
+            return
+
+        self._shard_sizes_cache = []
+        self._shard_batches_cache = []
+
+        for path in self.files:
+            tokens = _load_data_shard(path)
+            size = len(tokens)
+            self._shard_sizes_cache.append(size)
+
+            # Вычисляем количество батчей в этом шарде
+            # Это приблизительно, но для seek подойдёт
+            if self.align_to_bos:
+                finder_temp = BOSFinder(tokens, world_size=self.world_size)
+                num_tokens_local = self.num_tokens // self.world_size
+                batch_count = 0
+                idx = 0
+                bos_idx = finder_temp.bos_idx
+                n = len(bos_idx)
+                size_total = tokens.numel()
+                while True:
+                    cur_len = 0
+                    start_idx = idx
+                    while cur_len <= num_tokens_local:
+                        if idx >= n:
+                            break
+                        cur = bos_idx[idx]
+                        end = min(bos_idx[idx + 1] if idx + 1 < n else size_total,
+                                  cur + self.max_seq_len,
+                                  cur + num_tokens_local - cur_len + 1)
+                        cur_len += end - cur
+                        idx += 1
+                    if cur_len <= num_tokens_local:
+                        break
+                    batch_count += 1
+                self._shard_batches_cache.append(batch_count)
+            else:
+                # Для unaligned: батчи размером num_tokens + 1
+                batch_count = size // (self.num_tokens + 1)
+                self._shard_batches_cache.append(batch_count)
 
     def _load_current_shard(self):
         if self._current_file_idx >= len(self.files):
@@ -1311,72 +1360,84 @@ class DistributedDataGenerator:
         self._microbatch_count = 0
         self._load_current_shard()
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        while True:
-            num_tokens_local = self.num_tokens // self.world_size
-            max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)
+    def __iter__(self):
+        # Теперь возвращает self, так как это итератор
+        return self
 
-            if self.align_to_bos:
-                # Wait for BOS index if still loading
-                if self._finder.thread is not None:
-                    self._finder.get()  # blocks until full index ready
+    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens_local = self.num_tokens // self.world_size
+        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)
 
-                try:
+        while True:  # Цикл, чтобы перезапустить с начала, если достигнут конец данных
+            try:
+                if self.align_to_bos:
+                    # Wait for BOS index if still loading
+                    if self._finder.thread is not None:
+                        self._finder.get()  # blocks until full index ready
+
                     seq_starts, seq_ends = self._finder.next_batch(num_tokens_local, self.max_seq_len)
-                except StopIteration:
-                    # Move to next shard
-                    self._current_file_idx += 1
+                    start_idxs = torch.tensor(seq_starts[self.rank])
+                    end_idxs = torch.tensor(seq_ends[self.rank])
+
+                    buf = torch.cat([self._tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+                    _inputs = buf[:-1]
+                    _targets = buf[1:]
+                    end_idxs[-1] -= 1
+                    cum_lengths = (end_idxs - start_idxs).cumsum(0)
+
+                else:
+                    if self._pos + self.num_tokens + 1 >= len(self._tokens):
+                        self._current_file_idx += 1
+                        # Проверяем, не достигли ли конца всех файлов
+                        if self._current_file_idx >= len(self.files):
+                            self._reset_to_start()  # Зацикливание: возвращаемся к началу
+                        else:
+                            self._load_current_shard()
+                            self._pos = 0
+                        # Проверка снова, на случай, если новый шард тоже мал
+                        if self._pos + self.num_tokens + 1 >= len(self._tokens):
+                            self._current_file_idx += 1
+                            if self._current_file_idx >= len(self.files):
+                                self._reset_to_start()
+                            else:
+                                self._load_current_shard()
+                                self._pos = 0
+
+                    pos_local = self._pos + self.rank * num_tokens_local
+                    buf = self._tokens[pos_local: pos_local + num_tokens_local + 1]
+                    _inputs = buf[:-1].view(num_tokens_local,)
+                    _targets = buf[1:].view(num_tokens_local,)
+                    cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+                    self._pos += self.num_tokens
+
+                _cum_lengths = torch.full((max_num_docs,), num_tokens_local, dtype=torch.int32)
+                _cum_lengths[0] = 0
+                _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+
+                # Увеличиваем счётчик до возврата
+                self._microbatch_count += 1
+
+                return (
+                    _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
+                    _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
+                    _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
+                )
+
+            except StopIteration:
+                # Это StopIteration от BOSFinder, означает конец текущего шарда
+                self._current_file_idx += 1
+                if self._current_file_idx >= len(self.files):
+                    self._reset_to_start()  # Зацикливание: возвращаемся к началу
+                else:
                     self._load_current_shard()
-                    continue
-
-                start_idxs = torch.tensor(seq_starts[self.rank])
-                end_idxs = torch.tensor(seq_ends[self.rank])
-
-                buf = torch.cat([self._tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
-                _inputs = buf[:-1]
-                _targets = buf[1:]
-                end_idxs[-1] -= 1
-                cum_lengths = (end_idxs - start_idxs).cumsum(0)
-
-            else:
-                if self._pos + self.num_tokens + 1 >= len(self._tokens):
-                    self._current_file_idx += 1
-                    self._load_current_shard()
-                    self._pos = 0
-
-                pos_local = self._pos + self.rank * num_tokens_local
-                buf = self._tokens[pos_local: pos_local + num_tokens_local + 1]
-                _inputs = buf[:-1].view(num_tokens_local,)
-                _targets = buf[1:].view(num_tokens_local,)
-                cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
-                self._pos += self.num_tokens
-
-            _cum_lengths = torch.full((max_num_docs,), num_tokens_local, dtype=torch.int32)
-            _cum_lengths[0] = 0
-            _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
-
-            # Единственный yield
-            new_params = yield (
-                _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
-                _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
-                _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
-            )
-            self._microbatch_count += 1
-
-            if new_params is not None:
-                new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-                assert new_num_tokens % (self.world_size * new_grad_accum_steps) == 0, \
-                    "new_num_tokens must be divisible by world_size * grad_accum_steps"
-                self._total_tokens_per_step = new_num_tokens
-                self.num_tokens = new_num_tokens // new_grad_accum_steps
-                self.max_seq_len = new_max_seq_len
-                self.grad_accum_steps = new_grad_accum_steps
-
+                # Продолжаем цикл, чтобы получить следующий батч из нового шарда
+                continue
+            
     def seek(self, step: int):
         """
         Перематывает генератор так, будто уже выполнено `step` шагов оптимизатора.
         Поддерживает step < 0 (возврат к началу + промотка).
-        Работает путём полного сброса и последовательной прокрутки.
+        Работает путём вычисления нужного шарда и позиции в нём с использованием кэша.
         """
         if step < 0:
             raise ValueError("step must be >= 0 (training always starts from step 0)")
@@ -1386,31 +1447,56 @@ class DistributedDataGenerator:
         # Сбрасываем всё
         self._reset_to_start()
 
-        # Проматываем вперёд target_microbatch микро-батчей
-        # (имитируем вызовы __iter__, но без yield)
-        microbatch_local = self.num_tokens // self.world_size
+        # --- Вычисляем нужный шард и позицию в нём ---
+        self._get_shard_sizes_and_batches() # Заполняем кэш, если ещё не заполнен
 
-        mb = 0
-        while mb < target_microbatch:
-            if self.align_to_bos:
+        current_mb_index = 0
+        target_mb_index = target_microbatch
+
+        found_shard = -1
+        found_mb_in_shard = -1
+        found_mb_offset_in_shard = -1
+
+        for i, batches_in_shard in enumerate(self._shard_batches_cache):
+            if current_mb_index + batches_in_shard > target_mb_index:
+                # Нужный батч находится в этом шарде
+                found_shard = i
+                found_mb_in_shard = target_mb_index - current_mb_index
+                found_mb_offset_in_shard = found_mb_in_shard
+                break
+            current_mb_index += batches_in_shard
+            if current_mb_index >= target_microbatch:
+                break
+
+        if found_shard == -1:
+            # Мы за пределами всех данных
+            raise StopIteration("Seek target is beyond the end of all data shards.")
+
+        # --- Загружаем найденный шард ---
+        self._current_file_idx = found_shard
+        self._load_current_shard() # Загружаем нужный шард
+
+        # --- Устанавливаем позицию в шарде ---
+        # Для align_to_bos: нужно "пропустить" found_mb_in_shard батчей
+        if self.align_to_bos:
+            # Wait for BOS index if still loading
+            if self._finder.thread is not None:
+                self._finder.get()
+
+            num_tokens_local = self.num_tokens // self.world_size
+            # Пропускаем found_mb_in_shard батчей
+            for _ in range(found_mb_in_shard):
                 try:
-                    # Имитируем next_batch, но не используем результат
-                    self._finder.next_batch(microbatch_local, self.max_seq_len)
-                    mb += 1
+                    self._finder.next_batch(num_tokens_local, self.max_seq_len)
                 except StopIteration:
-                    self._current_file_idx += 1
-                    self._load_current_shard()
-                    # продолжаем
-            else:
-                # Просто сдвигаем _pos
-                if self._pos + self.num_tokens + 1 >= len(self._tokens):
-                    self._current_file_idx += 1
-                    self._load_current_shard()
-                    self._pos = 0
-                self._pos += self.num_tokens
-                mb += 1
+                    # Это не должно произойти, если кэширование верно
+                    raise RuntimeError(f"Seek: Unexpected StopIteration in shard {found_shard} at batch {found_mb_in_shard}")
 
-        # После seek — счётчик синхронизирован
+        else:
+            # Для unaligned: позиция = found_mb_offset_in_shard * num_tokens
+            self._pos = found_mb_offset_in_shard * self.num_tokens
+
+        # Устанавливаем общий счётчик
         self._microbatch_count = target_microbatch
 
 # -----------------------------------------------------------------------------
@@ -1720,7 +1806,7 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 warmup_steps = 1
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = iter(DistributedDataGenerator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps))
+train_loader = DistributedDataGenerator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 t0 = time.perf_counter()
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
@@ -1751,7 +1837,7 @@ del train_loader, initial_state
 
 train_dataloader = DistributedDataGenerator(train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 if start_step != 0: train_dataloader.seek(start_step)
-train_loader = iter(train_dataloader)
+train_loader = train_dataloader
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -1776,7 +1862,7 @@ for step in range(start_step, start_step + train_steps + 1):
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = iter(DistributedDataGenerator(val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False))
+        val_loader = DistributedDataGenerator(val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
         t1 = time.perf_counter()
         with torch.no_grad():

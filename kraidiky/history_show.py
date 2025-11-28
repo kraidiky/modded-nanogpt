@@ -20,7 +20,7 @@ from pathlib import Path
 import history as h
 
 input_path:str = r"../logs/20251120_1001-986f2c01-f9c8-4030-a473-4706d532aaa2/last_history.pt"
-input_path:str = r"../logs/20251126_2307-dab0d91f-f078-4702-a76f-54ad07004118/last_history.pt"
+input_path:str = r"../logs/20251127_0848-longrun/last_history.pt"
 if len(sys.argv) > 1:
     input_path = sys.argv[1]
 parent_path = Path(input_path).parent
