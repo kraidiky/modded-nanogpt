@@ -1521,6 +1521,7 @@ class Hyperparameters:
     run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
+    save_last_checkpoint:int = 125 # 0 - никогда. Раз в сколько чётных step-ов в начале цикла записывается чекпоинт. Чётных потому что у нас один из двух оптимизаторов вызывается только в нечётные step-ы
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
@@ -1877,6 +1878,7 @@ for step in range(start_step, start_step + train_steps + 1):
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
         history and h.capture_model_state(history, model, start_step)
+        
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1884,10 +1886,12 @@ for step in range(start_step, start_step + train_steps + 1):
         if master_process:
             SaveStateToFile('last')
 
-    if master_process:
-        if last_step or args.save_checkpoint:
-            SaveStateToFile(f"step{step:06d}.pt")
-        
+        if master_process:
+            if args.save_checkpoint:
+                SaveStateToFile(f"step{step:06d}")
+
+    if master_process and (args.save_last_checkpoint > 0) and (step%(2*args.save_last_checkpoint) == 0):
+        SaveStateToFile('last')
 
     # --------------- TRAINING SECTION -----------------
     train_losses = []
