@@ -8,6 +8,7 @@ factory = SimpleNamespace(list = lambda:[],
                           dict = lambda:{},
                           namespace = lambda:SimpleNamespace())
 keys = SimpleNamespace(loss='loss', train='train', val='val', lr='lr',
+                       train_0='train_0', train_1='train_1',
                        config='config', model='model',
                        structure='structure', zeros='zeros', zeros_per_layer='zeros_per_layer',
                        )

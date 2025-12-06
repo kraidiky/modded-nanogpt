@@ -145,22 +145,24 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         @torch.compile
         def impl(grad: torch.Tensor, x_f8: torch.Tensor, w_f8: torch.Tensor):
             assert grad.is_contiguous()
-            x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-            w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-            grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-            
-            # Преобразуем FP8 в FP16 или FP32 перед вычислениями
-            grad_fp16 = grad.div(grad_s).to(torch.bfloat16)
-            x_fp16 = x_f8.to(torch.bfloat16)
-            w_fp16 = w_f8.to(torch.bfloat16)
-            
-            # grad_x = torch.mm(grad_fp16, w_fp16) * grad_inv_s * w_inv_s  # (8192, 50304) @ (50304, 768) = (8192, 768)
-            grad_x = torch.mm(grad_fp16, w_fp16) * grad_inv_s * w_inv_s
-            
-            # grad_w = torch.mm(x_fp16.T, grad_fp16.T) * x_inv_s * grad_inv_s  # (768, 8192) @ (50304, 8192).T = (768, 8192) @ (8192, 50304) = (768, 50304)
-            grad_w = torch.mm(x_fp16.T, grad_fp16) * x_inv_s * grad_inv_s  # (768, 50304)
-            grad_w = grad_w.T  # (50304, 768)
-            
+            # Восстанавливаем размерности
+            # grad: (4096, 50304) - градиент выхода
+            # x_f8: (4096, 768) - вход в FP8
+            # w_f8: (50304, 768) - веса в FP8
+            # Преобразуем в bfloat16 с правильным масштабированием
+            grad_bf16 = grad.to(torch.bfloat16)  # grad уже масштабирован
+            x_bf16 = x_f8.to(torch.bfloat16) * x_s
+            w_bf16 = w_f8.to(torch.bfloat16) * w_s  # w: (50304, 768)
+            # grad_x = grad @ w  (4096, 50304) @ (50304, 768) = (4096, 768)
+            # Здесь w уже хранится транспонированным для умножения x @ w.T
+            # Значит для grad_x нам нужно grad @ w
+            grad_x = torch.mm(grad_bf16, w_bf16)  # (4096, 50304) @ (50304, 768)
+            grad_x = grad_x / (grad_s * w_s)
+            # grad_w = x.T @ grad  (768, 4096) @ (4096, 50304) = (768, 50304)
+            # Нужно транспонировать в конце для соответствия размеру w: (50304, 768)
+            grad_w = torch.mm(x_bf16.T, grad_bf16)  # (768, 4096) @ (4096, 50304)
+            grad_w = grad_w.T  # (50304, 768) - транспонируем чтобы соответствовать w
+            grad_w = grad_w / (x_s * grad_s)
             return grad_x.to(torch.bfloat16), grad_w.to(torch.float32)
     return impl(g, x_f8, w_f8)
 
@@ -475,6 +477,7 @@ def polar_express(G: torch.Tensor):
 
     if G.size(-2) > G.size(-1):
         X = X.mT
+
     return X
 
 
@@ -719,6 +722,7 @@ class NorMuon(torch.optim.Optimizer):
             vnorm = v_chunk.norm(dim=(-2,-1), keepdim=True)
             v_mean = torch.mean(v_chunk * v_chunk, dim=-1, keepdim=True) if v_chunk.size(-2) >= v_chunk.size(-1) else torch.mean(v_chunk * v_chunk, dim=-2, keepdim=True)
             second_momentum_buffer.lerp_(v_mean.float(), 1 - group["beta2"])
+            
             step_size = 1 / second_momentum_buffer.sqrt().clamp_min(1e-10)
             v_chunk.mul_(step_size)
             vnorm_new = v_chunk.norm(dim=(-2,-1), keepdim=True)
@@ -1321,7 +1325,6 @@ class DistributedDataGenerator:
                 size_total = tokens.numel()
                 while True:
                     cur_len = 0
-                    start_idx = idx
                     while cur_len <= num_tokens_local:
                         if idx >= n:
                             break
@@ -1499,6 +1502,7 @@ class DistributedDataGenerator:
         # Устанавливаем общий счётчик
         self._microbatch_count = target_microbatch
 
+
 # -----------------------------------------------------------------------------
 # int main
 resume = ''
@@ -1514,12 +1518,15 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 //4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40000 # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 160000 # number of steps to continue training at final lr and ws
+    num_lr_cooldown_iterations: int = 40000
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    collect_train_0 = False # Собирать ли трейн loss на первых изученных данных
+    collect_train_1 = False # Собирать ли трейн loss на последних изученных данных
     save_checkpoint: bool = False
     save_last_checkpoint:int = 125 # 0 - никогда. Раз в сколько чётных step-ов в начале цикла записывается чекпоинт. Чётных потому что у нас один из двух оптимизаторов вызывается только в нечётные step-ы
     # attention masking
@@ -1649,7 +1656,7 @@ def LoadOptimizersMemCheckpoint(state_dict_list:list[dict]):
     for opt,state_dict in zip(optimizers, state_dict_list):
         opt:torch.optim.Optimizer=opt
         opt.load_state_dict(state_dict)  # TODO а это надо ли раздовать? На warmup наверное не надо полагаться?
-    # Костыль для оптимизатора NorMuon, который в стейте хранит тензоры разных типов, а load_state_dict приводит их к типу параметра
+    # TODO Перенести в сам оптимизатор Костыль для оптимизатора NorMuon, который в стейте хранит тензоры разных типов, а load_state_dict приводит их к типу параметра
     param_list = [] # Собираем маппинг: индекс_параметра → сам Parameter
     for group in opt.param_groups:
         param_list.extend(group['params']) # Теперь param_list[i] — это i-й параметр (тот, что соответствует state_dict['state'][i])
@@ -1744,7 +1751,7 @@ history and h.capture_model_state(history, model, start_step)
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
-    x = min(0.9999, step / args.num_iterations)
+    x = min(0.9999, step / args.num_lr_cooldown_iterations)
     assert 0 <= x < 1
     lr = 1.0
     if x >= 1 - args.cooldown_frac:
@@ -1769,6 +1776,8 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     if step < muon_warmup_steps:
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
+    elif step > args.num_iterations: # Вообще-то такого быть не должно, но если где-то ошибиться, то бывает, как выяснилось, и приводит к абсолютно нереальным параметрам
+        momentum = momentum_min
     elif step > momentum_cd_start:
         frac = (step - momentum_cd_start) / muon_cooldown_steps
         momentum = momentum_max - frac * (momentum_max - momentum_min)
@@ -1844,10 +1853,13 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
-for step in range(start_step, start_step + train_steps + 1):
-    last_step = (step == start_step + train_steps)
+step = start_step
+while True:
+    step += 1
+    if step >= args.num_iterations:
+        break
+    last_step = (step == args.num_iterations-1)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
@@ -1870,14 +1882,48 @@ for step in range(start_step, start_step + train_steps + 1):
             for val_i in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
-                if (val_i % 200 == 0) or (val_i+1 == val_steps):
+                if (val_i % 300 == 19) or (val_i+1 == val_steps):
                     print0(f'val progress: {val_i+1}/{val_steps} spends:{time_to_progress(time.perf_counter() - t1,val_i+1,val_steps)} val_loss:{val_loss/(val_i+1):.4f}', console=True)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+        print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
         history and h.capture_model_state(history, model, start_step)
+
+        if args.collect_train_1: # Собрать loss на train на последних изученных токенах
+            assert args.val_batch_size % args.train_batch_size == 0 # предполагаем, что кратное количество просто с соображений оптимизации...
+            train_steps = min(grad_accum_steps * step, grad_accum_steps * args.val_tokens // args.train_batch_size) # 
+            train_loader.seek(step - train_steps)
+            train_loss = 0
+            t2 = time.perf_counter()
+            with torch.no_grad():
+                for train_i in range(train_steps):
+                    inputs, targets, cum_seqlens = next(train_loader)
+                    train_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
+                    if (train_i % 600 == 39):
+                        print0(f'train[-1] progress: {train_i+1}/{train_steps} spends:{time_to_progress(time.perf_counter() - t2,train_i+1,train_steps)} train[-1].loss:{train_loss/(train_i+1):.4f}', console=True)
+            train_loss /= train_steps
+            dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{args.num_iterations} train[-1].loss:{train_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+            history and h.get(h.get(history, h.keys.loss), h.keys.train_1, h.factory.list).append((step,train_loss.item()))
+        if args.collect_train_0:
+            assert args.val_batch_size % args.train_batch_size == 0 # предполагаем, что кратное количество просто с соображений оптимизации...
+            train_steps = min(grad_accum_steps * step, grad_accum_steps * args.val_tokens // args.train_batch_size) # 
+            train_loader.seek(0)
+            train_loss = 0
+            t2 = time.perf_counter()
+            with torch.no_grad():
+                for train_i in range(train_steps):
+                    inputs, targets, cum_seqlens = next(train_loader)
+                    train_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
+                    if (train_i % 600 == 39):
+                        print0(f'train[-1] progress: {train_i+1}/{train_steps} spends:{time_to_progress(time.perf_counter() - t2,train_i+1,train_steps)} train[0].loss:{train_loss/(train_i+1):.4f}', console=True)
+            train_loss /= train_steps
+            train_loader.seek(step)
+            dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{args.num_iterations} train[0].loss:{train_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+            history and h.get(h.get(history, h.keys.loss), h.keys.train_0, h.factory.list).append((step,train_loss.item()))
         
         model.train()
         # start the clock again
@@ -1906,7 +1952,7 @@ for step in range(start_step, start_step + train_steps + 1):
     
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step - start_step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{args.num_iterations} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step - start_step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
