@@ -766,7 +766,22 @@ class NorMuon(torch.optim.Optimizer):
             unstacked_params = torch.unbind(stacked_params)
             for i, p in enumerate(orig_params):
                 p.copy_(unstacked_params[i], non_blocking=True)
+    def load_state_dict(self, state_dict):
+        super(NorMuon,self).load_state_dict(state_dict)
+            # Костыль для оптимизатора NorMuon, который в стейте хранит тензоры разных типов, а super.load_state_dict приводит их к типу параметра
+        param_list = [] # Собираем маппинг: индекс_параметра → сам Parameter
+        for group in self.param_groups:
+            param_list.extend(group['params']) # Теперь param_list[i] — это i-й параметр (тот, что соответствует state_dict['state'][i])
+        for param_idx, param_state_in_dict in state_dict['state'].items(): # Обходим все записи в оригинальном хранилище
+            if 'second_momentum_buffer' in param_state_in_dict: # Получаем соответствующий Parameter
+                p = param_list[param_idx]
+                current_state = self.state[p if p in opt.state else id(p)]
+                old = param_state_in_dict['second_momentum_buffer']
+                current = current_state['second_momentum_buffer']
+                if old.dtype != current.dtype:
+                    current_state['second_momentum_buffer'] = old.clone().to(current.device) # Чтобы типы, и соответственно точность не портить
 
+        
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
@@ -1510,21 +1525,21 @@ resume = ''
 @dataclass
 class Hyperparameters:
     # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on # 00000*
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_batch_size: int = 2048 * 16 * 1 # *8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 //4 # *8
+    val_batch_size: int = 4 * 64 * 1024 // 4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 160000 # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 160000 #40 # number of steps to continue training at final lr and ws
     num_lr_cooldown_iterations: int = 40000
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int =  250  # every how many steps to evaluate val loss? 0 for only at the end
     collect_train_0 = False # Собирать ли трейн loss на первых изученных данных
     collect_train_1 = False # Собирать ли трейн loss на последних изученных данных
     save_checkpoint: bool = False
@@ -1534,6 +1549,15 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+    # Программа автоподбора гиперпараметров
+    hp_tuning_program:str = 'initial' # None | default, all_params, initial, 'alarm'
+    adam_lr:float = 0.008
+    adam_weight_decay:float = 0.005
+    adam_beta0:float = 0.65
+    muon_lr:float = 0.023
+    muon_momentum:float = 0.95
+    muon_weight_decay:float = 1.2
+
 @dataclass
 class Modelparameters:
     #data
@@ -1594,7 +1618,7 @@ dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 history = h.empty() if master_process else None
-history and h.capture_config(history, 0, hiperparameters = args)
+history and h.capture_config(history, 0, hyperparameters = args)
 history and h.capture_config(history, 0, model_params = model_args)
 history and h.capture_config(history, 0, torchrun = SimpleNamespace(
     MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
@@ -1606,7 +1630,6 @@ history and h.capture_config(history, 0, torchrun = SimpleNamespace(
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
@@ -1641,44 +1664,37 @@ def data_info(target):
     return target
 
 # Чекпоинтам не место в видеопамяти, у нас её и так мало
-def SaveModelCheckpoint(model:torch.nn.Module):
-    return {k:v.cpu().detach() for k,v in model.state_dict()}
-def SaveOptimizersMemCheckpoint() -> list[dict]:
-    state = [opt.state_dict() for opt in optimizers]
-    for opt in state:
-        for part in opt['state'].values():
-            for key in list(part.keys()):
-                if isinstance(part[key], torch.Tensor):
-                    part[key] = part[key].cpu()
+def to_cpu(state):
+    if isinstance(state, dict): return {k:to_cpu(v) for k,v in state.items()}
+    if isinstance(state, list): return [to_cpu(v) for v in state]
+    if isinstance(state, torch.Tensor): return state.cpu()
     return state
+def to_cuda(state):
+    if isinstance(state, dict): return {k:to_cuda(v) for k,v in state.items()}
+    if isinstance(state, list): return [to_cuda(v) for v in state]
+    if isinstance(state, torch.Tensor): return state.cuda()
+    return state
+def SaveModelCheckpoint():
+    return OrderedDict([(k,v.cpu().detach()) for k,v in model.state_dict().items()])
+def SaveOptimizersMemCheckpoint() -> list[dict]:
+    return to_cpu([opt.state_dict() for opt in optimizers])
 # Надо проверить в какой памяти в итоге окажутся те тензоры, которые я буду не руками переносить
-def LoadOptimizersMemCheckpoint(state_dict_list:list[dict]):
-    for opt,state_dict in zip(optimizers, state_dict_list):
-        opt:torch.optim.Optimizer=opt
-        opt.load_state_dict(state_dict)  # TODO а это надо ли раздовать? На warmup наверное не надо полагаться?
-    # TODO Перенести в сам оптимизатор Костыль для оптимизатора NorMuon, который в стейте хранит тензоры разных типов, а load_state_dict приводит их к типу параметра
-    param_list = [] # Собираем маппинг: индекс_параметра → сам Parameter
-    for group in opt.param_groups:
-        param_list.extend(group['params']) # Теперь param_list[i] — это i-й параметр (тот, что соответствует state_dict['state'][i])
-    for param_idx, param_state_in_dict in state_dict_list[1]['state'].items(): # Обходим все записи в оригинальном хранилище
-        if 'second_momentum_buffer' in param_state_in_dict: # Получаем соответствующий Parameter
-            p = param_list[param_idx]
-            current_state = opt.state[p if p in opt.state else id(p)]
-            old = param_state_in_dict['second_momentum_buffer']
-            current = current_state['second_momentum_buffer']
-            if old.dtype != current.dtype:
-                current_state['second_momentum_buffer'] = old.clone().to(current.device) # Чтобвы типы, и соответственно точность не портить
+def LoadOptimizersMemCheckpoint(state_dict_list:list[OrderedDict]):
+    state_dict_list = to_cuda(state_dict_list)
+    optimizers[0].load_state_dict(state_dict_list[0])  # TODO а это надо ли раздавать?
+    optimizers[1].load_state_dict(state_dict_list[1])
 
-def SaveStateToFile(prefix:str):
+def SaveStateToFile(prefix:str, backup:bool=True):
     # Оставляю запись в точности такой, какой она была в оригинальном файлк, для совместимости
     os.makedirs(f"logs/{run_id}", exist_ok=True)
     history_path = f"logs/{run_id}/{prefix}_history.pt"
     model_path = f"logs/{run_id}/{prefix}_model.pt"
-    if os.path.exists(history_path): os.rename(history_path, f"{history_path}.bak")
-    if os.path.exists(model_path): os.rename(model_path, f"{model_path}.bak")    
+    if backup and os.path.exists(history_path): os.rename(history_path, f"{history_path}.bak")
+    if backup and os.path.exists(model_path): os.rename(model_path, f"{model_path}.bak")    
     # При такой схеме записи, кстати, не факт, что буфер успеет корректно записаться. Но так чуть понадёжнее...
     torch.save(history, history_path)
     torch.save(dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]), model_path)
+    return model_path
 
 def LoadStateFromFile(path:str):
     global step, history
@@ -1686,8 +1702,7 @@ def LoadStateFromFile(path:str):
     step = loaded_state['step']
     # Возможно надо привести заголовки к другому формату, потому что иногда сохраняется компилированная модель, а иногда оригинальная. '_orig_mod.scalars' вместо 'scalars'
     assert all([(p1.shape==p2.shape) and (n2.endswith(n1) or n1.endswith(n2)) for (n1,p1),(n2,p2) in zip(loaded_state['model'].items(), model.named_parameters())])
-    model_state_dictionary = OrderedDict(**{n2:p1 for (n1,p1),(n2,p2) in zip(loaded_state['model'].items(), model.named_parameters())})
-    model.load_state_dict(model_state_dictionary) # TODO и раздать через dist
+    model.load_state_dict(OrderedDict(**{n2:p1 for (n1,p1),(n2,p2) in zip(loaded_state['model'].items(), model.named_parameters())})) # Разница в именах в компилируемой и не компилируемой модели # TODO и раздать через dist?
     LoadOptimizersMemCheckpoint(loaded_state['optimizers'])
     history_path = path.replace("_model.pt", "_history.pt")
     if os.path.exists(history_path):
@@ -1723,12 +1738,15 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
-    lr=0.008,
-    betas=(0.65, 0.95),
+    lr=args.adam_lr,
+    betas=(args.adam_beta0, 0.95),
     eps=1e-8,
-    weight_decay=0.0,
+    weight_decay=args.adam_weight_decay,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0, beta2=0.95)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, beta2=0.95,
+                     lr=args.muon_lr,
+                     momentum=args.muon_momentum,
+                     weight_decay=args.muon_weight_decay)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -1739,15 +1757,77 @@ if (resume != '') and (resume is not None) and True: # Загрузка сост
     LoadStateFromFile(resume)
     start_step = step
 
-history and h.capture_config(history, start_step, hiperparameters = args)
+history and h.capture_config(history, start_step, hyperparameters = args)
 history and h.capture_config(history, start_step, model_params = model_args)
 history and h.capture_config(history, start_step, torchrun = SimpleNamespace(
     MASTER_ADDR=os.environ.get("MASTER_ADDR"), MASTER_PORT=os.environ.get("MASTER_PORT"),
     RANK=os.environ.get("RANK"), WORLD_SIZE=os.environ.get("WORLD_SIZE"),
     LOCAL_RANK=os.environ.get("LOCAL_RANK"),
     DISABLE_FP8=os.environ.get("DISABLE_FP8")))
-history and h.capture_model_state(history, model, start_step)
 
+tuning,schedule_lr, schedule_muon_momentum = None,True,True
+if args.hp_tuning_program is not None:
+    print0(f'Hyperparameters Tuning Program: {args.hp_tuning_program}')
+    os.makedirs(f"logs/{run_id}", exist_ok=True)
+    hpt_log_file = f"logs/{run_id}/hpt_log.txt"
+    def print0hpt(s):
+        if master_process:
+            with open(hpt_log_file, "a") as f:
+                print(s, file=f)
+        print0(f"HPT: {s}", console=True)
+
+    def LoadCheckpoint(state:tuple[dict,dict] | str):
+        global step
+        if isinstance(state, str):
+            LoadStateFromFile(state)
+        else:
+            model.load_state_dict(state[0]['model'])
+            LoadOptimizersMemCheckpoint(state[0]['optimizers'])
+            step = state[0]['step']
+            global history
+            history = copy.deepcopy(state[1])
+        train_dataloader.seek(step)
+    def SaveCheckpoint(id:str) -> tuple[dict,dict] | str:
+        return SaveStateToFile(id, False)
+        data =  (dict(step=step, code=code, model=SaveModelCheckpoint(), optimizers=SaveOptimizersMemCheckpoint()), copy.deepcopy(history))
+        torch.cuda.empty_cache()
+        return data
+    def set_lr(value:float):
+        factor = value/optimizer1.param_groups[0]['initial_lr']
+        for p in list(optimizer1.param_groups) + list(optimizer2.param_groups):
+            p['lr'] = factor*p['initial_lr']
+        args.adam_lr = value
+        args.muon_lr = optimizer2.param_groups[0]['lr']
+    def set_adam_lr(value:float):
+        for p in optimizer1.param_groups: p['lr'] = value
+        args.adam_lr = value
+    def set_muon_lr(value:float):
+        for p in optimizer2.param_groups: p['lr'] = value
+        args.muon_lr = value
+    def set_wd(value:float):
+        for p in list(optimizer1.param_groups) + list(optimizer2.param_groups): p['weight_decay'] = value
+    def set_adam_wd(value:float):
+        for p in optimizer1.param_groups: p['weight_decay'] = value
+    def set_muon_wd(value:float):
+        for p in optimizer2.param_groups: p['weight_decay'] = value
+    def set_betas(value:float):
+        for p in optimizer1.param_groups: p['betas'] = (1-1/value, p['betas'][1])
+    def set_muon_momentum(value:float):
+        for p in optimizer2.param_groups: p['momentum'] = 1-1/value
+
+    import kraidiky.hyperparameters_tuning as hpt
+    tuning = hpt.HyperparametersTuning(LoadCheckpoint, SaveCheckpoint, print0hpt)
+    tuning.set_program(hpt.programs[args.hp_tuning_program] if isinstance(args.hp_tuning_program, str) else args.hp_tuning_program)
+    tuning.register_affected_parameter('lr', lambda: optimizer1.param_groups[0]['lr'], set_lr)
+    tuning.register_affected_parameter('adam_lr', lambda: optimizer1.param_groups[0]['lr'], set_adam_lr)
+    tuning.register_affected_parameter('muon_lr', lambda: optimizer2.param_groups[0]['lr'], set_muon_lr)
+    schedule_lr = False
+    tuning.register_affected_parameter('wd', lambda: optimizer1.param_groups[0]['weight_decay'], set_wd)
+    tuning.register_affected_parameter('adam_wd', lambda: optimizer1.param_groups[0]['weight_decay'], set_wd)
+    tuning.register_affected_parameter('muon_wd', lambda: optimizer2.param_groups[0]['weight_decay'], set_wd)
+    tuning.register_affected_parameter('betas', lambda: 1/(1-optimizer1.param_groups[0]['betas'][0]), set_betas)
+    tuning.register_affected_parameter('muon_momentum', lambda: 1/(1-optimizer2.param_groups[0]['momentum']), set_muon_momentum)
+    schedule_muon_momentum = False
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
@@ -1787,14 +1867,16 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
 
 def step_optimizers(step: int, optimizers, model):
     # update lr
-    for optimizer in optimizers:
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+    if schedule_lr:
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
 
     # set muon momentum based on step
-    momentum = get_muon_momentum(step)
-    for group in optimizers[1].param_groups:
-        group["momentum"] = momentum
+    if schedule_muon_momentum:
+        momentum = get_muon_momentum(step)
+        for group in optimizers[1].param_groups:
+            group["momentum"] = momentum
 
     # on even steps, only step Muon params
     # on odd steps, step all params
@@ -1806,7 +1888,7 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 ########################################
 #            Warmup kernels            #
@@ -1820,6 +1902,7 @@ train_loader = DistributedDataGenerator(train_files, args.train_batch_size, args
 t0 = time.perf_counter()
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
+    inputs %= model_args.vocab_size; targets %= model_args.vocab_size # TODEBUG
     # each window size is a new graph, need to warm up each with Yarn.attn_scale
     ws_idx = step % len(args.ws_schedule)
     if ws_idx==0:
@@ -1835,7 +1918,7 @@ for step in range(warmup_steps):
         opt.step()
     model.zero_grad(set_to_none=True)
     if (step%10 == 0) or (step+1 == warmup_steps):
-        print0(f'warmap:{step+1}/{warmup_steps} time:{time_to_progress(time.perf_counter()-t0, step+1, warmup_steps)}', console = True)
+        print0(f'warmup:{step+1}/{warmup_steps} time:{time_to_progress(time.perf_counter()-t0, step+1, warmup_steps)}', console = True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
 LoadOptimizersMemCheckpoint(initial_state["optimizers"])
@@ -1854,7 +1937,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 ws_short, ws_long = get_ws(0)
-step = start_step
+step = start_step-1
 while True:
     step += 1
     if step >= args.num_iterations:
@@ -1881,13 +1964,14 @@ while True:
         with torch.no_grad():
             for val_i in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
+                inputs %= model_args.vocab_size; targets %= model_args.vocab_size # TODEBUG
                 val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
                 if (val_i % 300 == 19) or (val_i+1 == val_steps):
                     print0(f'val progress: {val_i+1}/{val_steps} spends:{time_to_progress(time.perf_counter() - t1,val_i+1,val_steps)} val_loss:{val_loss/(val_i+1):.4f}', console=True)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+        print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
         history and h.capture_model_state(history, model, start_step)
 
@@ -1900,12 +1984,13 @@ while True:
             with torch.no_grad():
                 for train_i in range(train_steps):
                     inputs, targets, cum_seqlens = next(train_loader)
+                    inputs %= model_args.vocab_size; targets %= model_args.vocab_size # TODEBUG
                     train_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
                     if (train_i % 600 == 39):
                         print0(f'train[-1] progress: {train_i+1}/{train_steps} spends:{time_to_progress(time.perf_counter() - t2,train_i+1,train_steps)} train[-1].loss:{train_loss/(train_i+1):.4f}', console=True)
             train_loss /= train_steps
             dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{args.num_iterations} train[-1].loss:{train_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+            print0(f"step:{step}/{args.num_iterations} train[-1].loss:{train_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)} step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
             history and h.get(h.get(history, h.keys.loss), h.keys.train_1, h.factory.list).append((step,train_loss.item()))
         if args.collect_train_0:
             assert args.val_batch_size % args.train_batch_size == 0 # предполагаем, что кратное количество просто с соображений оптимизации...
@@ -1916,15 +2001,18 @@ while True:
             with torch.no_grad():
                 for train_i in range(train_steps):
                     inputs, targets, cum_seqlens = next(train_loader)
+                    inputs %= model_args.vocab_size; targets %= model_args.vocab_size # TODEBUG
                     train_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
                     if (train_i % 600 == 39):
                         print0(f'train[-1] progress: {train_i+1}/{train_steps} spends:{time_to_progress(time.perf_counter() - t2,train_i+1,train_steps)} train[0].loss:{train_loss/(train_i+1):.4f}', console=True)
             train_loss /= train_steps
             train_loader.seek(step)
             dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{args.num_iterations} train[0].loss:{train_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+            print0(f"step:{step}/{args.num_iterations} train[0].loss:{train_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)} step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
             history and h.get(h.get(history, h.keys.loss), h.keys.train_0, h.factory.list).append((step,train_loss.item()))
         
+        tuning and tuning.cycle(history)
+
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1943,6 +2031,7 @@ while True:
     train_losses = []
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
+        inputs %= model_args.vocab_size; targets %= model_args.vocab_size # TODEBUG
         train_loss = model(inputs, targets, cum_seqlens, ws_short, ws_long)
         train_loss.backward()
         train_losses.append((train_loss.detach()/targets.size(0)).item())
@@ -1952,7 +2041,7 @@ while True:
     
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step - start_step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{args.num_iterations} loss:{sum(train_losses)/len(train_losses):.4f} train_time:{time_to_progress(approx_training_time_ms/1000, step+1, args.num_iterations)} step_avg:{approx_training_time_ms/(step - start_step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

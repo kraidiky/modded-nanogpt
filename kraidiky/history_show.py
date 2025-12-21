@@ -19,7 +19,7 @@ from pathlib import Path
 
 import history as h
 
-input_path:str = r"../logs/20251206_1336-train_0-train_1/last_history.pt"
+input_path:str = r"logs/20251219_0134-all_params/last_history.pt"
 if len(sys.argv) > 1:
     input_path = sys.argv[1]
 parent_path = Path(input_path).parent
@@ -91,4 +91,21 @@ plt.savefig(parent_path/"loss.png")
 plt.close('all')
 
 ########## ########## PERPLEXITY ########## ##########
+print(h.get(loss, h.keys.val))
+plt.plot(loss_train[0],[math.exp(l) for l in train] , c=color_by_id(0), label=f'train: {math.exp(loss_train[1][-1]):.3f} min:{math.exp(min(loss_train[1])):.3f}')
+plt.plot(loss_val[0],[math.exp(l) for l in loss_val[1]] , c=color_by_id(4), label=f'val: {math.exp(loss_val[1][-1]):.3f} min:{math.exp(min(loss_val[1])):.3f}')
 
+plt.title("perplexity")
+plt.legend()
+plt.grid(which='both')
+plt.yscale('log')
+plt.savefig(parent_path/"perplexity.png")
+plt.close('all')
+
+########## ########## CONFIGURATION ########## ##########
+configs = h.get(history, h.keys.config)
+for config_key,values in list(configs.items()):
+    for key,series in values.items():
+        #if all()
+            pass
+        #keys = [k for k,s in values if all(*[v == s[0][1]  for t,v in s[1:]])]
