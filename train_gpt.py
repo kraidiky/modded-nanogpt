@@ -1550,13 +1550,13 @@ class Hyperparameters:
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # Программа автоподбора гиперпараметров
-    hp_tuning_program:str = 'initial' # None | default, all_params, initial, 'alarm'
-    adam_lr:float = 0.008
-    adam_weight_decay:float = 0.005
-    adam_beta0:float = 0.65
-    muon_lr:float = 0.023
-    muon_momentum:float = 0.95
-    muon_weight_decay:float = 1.2
+    hp_tuning_program:str = 'all_params' # None | default, all_params, initial,
+    adam_lr:float = 0.008 * pow(10, -2/5)
+    adam_weight_decay:float = 0.005 * pow(10, -1/5)
+    adam_beta0:float = 1-1/(1/(1-0.65) * pow(10, -1/5)) #0.65
+    muon_lr:float = 0.023 * pow(10, 1/5)
+    muon_momentum:float = 1-1/(1/(1-0.95) * pow(10, -3/5)) # 0.95
+    muon_weight_decay:float = 1.2 * pow(10, -1/5)
 
 @dataclass
 class Modelparameters:
@@ -2011,7 +2011,9 @@ while True:
             print0(f"step:{step}/{args.num_iterations} train[0].loss:{train_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)} step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
             history and h.get(h.get(history, h.keys.loss), h.keys.train_0, h.factory.list).append((step,train_loss.item()))
         
-        tuning and tuning.cycle(history)
+        if tuning is not None:
+            tuning.cycle(history)
+            history and h.capture_config(history, step, hyperparameters = args)
 
         model.train()
         # start the clock again

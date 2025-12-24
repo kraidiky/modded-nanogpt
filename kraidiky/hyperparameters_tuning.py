@@ -267,19 +267,8 @@ all_grouped_params = [betas,muon_momentum,wd,lr]
 
 programs = {'initial':[all_params+all_params+all_params]+[all_params]*100,
             'all_params':[[]]+[all_params]*100, # Предполагаем, что на момент запуска цикла инишиал параметры уже подобраны
-            'alrmm':[[muon_momentum,lr]],
             'default':[[lr],
                        [wd],
                        [lr],
                        [betas,muon_momentum]]}
-
-class TheSame(ExponentialAffector):
-    def __init__(self, name):
-        super().__init__(name, 1, 1)
-    def __call__(self, cfg:dict[str, float | int], history:dict) -> dict[str, float | int] | None:
-        value = cfg[self.name]
-        cfg = cfg.copy()
-        cfg[self.name] = value
-        return cfg
-programs['the_same'] = [[[TheSame('lr')]]]
 
