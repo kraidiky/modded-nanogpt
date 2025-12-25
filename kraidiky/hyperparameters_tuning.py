@@ -239,13 +239,13 @@ class ExponentialAffector(AssessedAffector):
         
 lr_up = ExponentialAffector('lr', pow(10,1/5), 1e-1)
 lr_down = ExponentialAffector('lr', 1/pow(10,1/5), 1e-7)
-lr = [lr_up,lr_down]
+lr = [lr_down,lr_up]
 adam_lr_up = ExponentialAffector('adam_lr', pow(10,1/5), 1e-1)
 adam_lr_down = ExponentialAffector('adam_lr', 1/pow(10,1/5), 1e-7)
-adam_lr = [adam_lr_up,adam_lr_down]
+adam_lr = [adam_lr_down,adam_lr_up]
 muon_lr_up = ExponentialAffector('muon_lr', pow(10,1/5), 1e-1)
 muon_lr_down = ExponentialAffector('muon_lr', 1/pow(10,1/5), 1e-7)
-muon_lr = [muon_lr_up,muon_lr_down]
+muon_lr = [muon_lr_down,muon_lr_up]
 wd_up = ExponentialAffector('wd', pow(10,1/5), 1e-1)
 wd_down = ExponentialAffector('wd', 1/pow(10,1/5), 1e-7)
 wd = [wd_up, wd_down]
@@ -262,11 +262,11 @@ muon_momentum_up = ExponentialAffector('muon_momentum', pow(10,1/5), 1000, toler
 muon_momentum_down = ExponentialAffector('muon_momentum', 1/pow(10,1/5), 2, tolerance=1.000001)
 muon_momentum = [muon_momentum_up, muon_momentum_down]
 
-all_params = [betas,muon_momentum,adam_wd,muon_wd,adam_lr,muon_lr]
+all_params = [adam_lr,muon_lr,betas,muon_momentum,adam_wd,muon_wd,]
 all_grouped_params = [betas,muon_momentum,wd,lr]
 
-programs = {'initial':[all_params+all_params+all_params]+[all_params]*100,
-            'all_params':[[]]+[all_params]*100, # Предполагаем, что на момент запуска цикла инишиал параметры уже подобраны
+programs = {'initial':[all_params+all_params]+[all_params]*100,
+            'all_params':[]+[all_params]*100, # [[]]+ Предполагаем, что на момент запуска цикла инишиал параметры уже подобраны
             'default':[[lr],
                        [wd],
                        [lr],

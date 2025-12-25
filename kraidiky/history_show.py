@@ -89,7 +89,7 @@ plt.grid(which='both')
 plt.yscale('log')
 plt.savefig(parent_path/"loss.png")
 plt.close('all')
-#print('loss_val:', loss_val)
+print('loss_val:', loss_val)
 
 ########## ########## PERPLEXITY ########## ##########
 plt.plot(loss_train[0],[math.exp(l) for l in train] , c=color_by_id(0), label=f'train: {math.exp(loss_train[1][-1]):.3f} min:{math.exp(min(loss_train[1])):.3f}')
