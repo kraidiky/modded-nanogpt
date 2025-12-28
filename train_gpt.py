@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
+import json
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1533,30 +1534,38 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 // 4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 160000 #40 # number of steps to continue training at final lr and ws
-    num_lr_cooldown_iterations: int = 40000
+    num_extension_iterations: int = 40 #40 # number of steps to continue training at final lr and ws
+    num_lr_cooldown_iterations: int = 2275
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
-    val_loss_every: int =  250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int =  50  # every how many steps to evaluate val loss? 0 for only at the end
     collect_train_0 = False # Собирать ли трейн loss на первых изученных данных
     collect_train_1 = False # Собирать ли трейн loss на последних изученных данных
     save_checkpoint: bool = False
-    save_last_checkpoint:int = 125 # 0 - никогда. Раз в сколько чётных step-ов в начале цикла записывается чекпоинт. Чётных потому что у нас один из двух оптимизаторов вызывается только в нечётные step-ы
+    save_last_checkpoint:int = 25 # 0 - никогда. Раз в сколько чётных step-ов в начале цикла записывается чекпоинт. Чётных потому что у нас один из двух оптимизаторов вызывается только в нечётные step-ы
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # Программа автоподбора гиперпараметров
-    hp_tuning_program:str = 'all_params' # None | default, all_params, initial,
-    adam_lr:float = 0.008 * pow(10, -2/5)
-    adam_weight_decay:float = 0.005 * pow(10, -1/5)
-    adam_beta0:float = 1-1/(1/(1-0.65) * pow(10, -1/5)) #0.65
-    muon_lr:float = 0.023 * pow(10, 1/5)
-    muon_momentum:float = 1-1/(1/(1-0.95) * pow(10, -3/5)) # 0.95
-    muon_weight_decay:float = 1.2 * pow(10, -1/5)
+    hp_tuning_program:str = None # None | default, all_params, initial,
+    adam_lr:float = 0.008 * pow(10, -3/5)
+    adam_weight_decay:float = 0.005
+    adam_beta0:float = 0.65
+    muon_lr:float = 0.023 * pow(10, -1/5)
+    muon_momentum:float = 1-1/(1/(1-0.95) * pow(10, -1/5)) # 0.95
+    muon_weight_decay:float = 0.0012559432157547902 # 
+    # universal scheduling
+    scheduling:str|None = '''{
+        "adam_lr":[[0,0.008],[50,0.005],[200,0.002],[400,0.0008],[600,0.0005],[1000,0.00035],[1400,0.00025],[1450,0.00024],[1500,0.00023],[1800,0.000177],[2000,0.000148],[2200,0.000125],[2400,0.000105]],
+        "muon_lr":[[0,0.055],[50,0.1],[150,0.02],[300,0.008],[400,0.007],[550,0.0058],[750,0.0047],[900,0.004],[1250,0.003],[1600,0.0023],[1950,0.002]],
+        "adam_beta0":[[0,0.65],[100,0.8],[300,0.55],[1600,0.55],[1750,0.8]],
+        "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]],
+        "adam_weight_decay":[[0,0.0031547867224009664],[50,0.0031547867224009673],[100,0.005000000000000002],[150,0.00792446596230557]]
+    }''' # or None
 
 @dataclass
 class Modelparameters:
@@ -1765,6 +1774,39 @@ history and h.capture_config(history, start_step, torchrun = SimpleNamespace(
     LOCAL_RANK=os.environ.get("LOCAL_RANK"),
     DISABLE_FP8=os.environ.get("DISABLE_FP8")))
 
+def set_lr(value:float):
+    factor = value/optimizer1.param_groups[0]['initial_lr']
+    for p in list(optimizer1.param_groups) + list(optimizer2.param_groups):
+        p['lr'] = factor*p['initial_lr']
+    args.adam_lr = value
+    args.muon_lr = optimizer2.param_groups[0]['lr']
+def set_adam_lr(value:float):
+    for p in optimizer1.param_groups: p['lr'] = value
+    args.adam_lr = value
+def set_muon_lr(value:float):
+    for p in optimizer2.param_groups: p['lr'] = value
+    args.muon_lr = value
+def set_wd(value:float):
+    for p in list(optimizer1.param_groups) + list(optimizer2.param_groups): p['weight_decay'] = value
+    args.adam_weight_decay = value
+    args.muon_weight_decay = value
+def set_adam_wd(value:float):
+    for p in optimizer1.param_groups: p['weight_decay'] = value
+    args.adam_weight_decay = value
+def set_muon_wd(value:float):
+    for p in optimizer2.param_groups: p['weight_decay'] = value
+    args.muon_weight_decay = value
+def set_betas(value:float):
+    for p in optimizer1.param_groups: p['betas'] = (value, p['betas'][1])
+    args.adam_beta0 = value
+def set_muon_momentum(value:float):
+    for p in optimizer2.param_groups: p['momentum'] = value
+    args.muon_momentum = value
+scheduling_processors = {'adam_lr':set_adam_lr,'muon_lr':set_muon_lr,
+                         'adam_beta0':set_betas, 'muon_momentum':set_muon_momentum,
+                         'adam_weight_decay':set_adam_wd,'muon_weight_decay':set_muon_wd,
+                         'lr':set_lr, 'wd':set_wd}
+
 tuning,schedule_lr, schedule_muon_momentum = None,True,True
 if args.hp_tuning_program is not None:
     print0(f'Hyperparameters Tuning Program: {args.hp_tuning_program}')
@@ -1792,28 +1834,6 @@ if args.hp_tuning_program is not None:
         data =  (dict(step=step, code=code, model=SaveModelCheckpoint(), optimizers=SaveOptimizersMemCheckpoint()), copy.deepcopy(history))
         torch.cuda.empty_cache()
         return data
-    def set_lr(value:float):
-        factor = value/optimizer1.param_groups[0]['initial_lr']
-        for p in list(optimizer1.param_groups) + list(optimizer2.param_groups):
-            p['lr'] = factor*p['initial_lr']
-        args.adam_lr = value
-        args.muon_lr = optimizer2.param_groups[0]['lr']
-    def set_adam_lr(value:float):
-        for p in optimizer1.param_groups: p['lr'] = value
-        args.adam_lr = value
-    def set_muon_lr(value:float):
-        for p in optimizer2.param_groups: p['lr'] = value
-        args.muon_lr = value
-    def set_wd(value:float):
-        for p in list(optimizer1.param_groups) + list(optimizer2.param_groups): p['weight_decay'] = value
-    def set_adam_wd(value:float):
-        for p in optimizer1.param_groups: p['weight_decay'] = value
-    def set_muon_wd(value:float):
-        for p in optimizer2.param_groups: p['weight_decay'] = value
-    def set_betas(value:float):
-        for p in optimizer1.param_groups: p['betas'] = (1-1/value, p['betas'][1])
-    def set_muon_momentum(value:float):
-        for p in optimizer2.param_groups: p['momentum'] = 1-1/value
 
     import kraidiky.hyperparameters_tuning as hpt
     tuning = hpt.HyperparametersTuning(LoadCheckpoint, SaveCheckpoint, print0hpt)
@@ -1823,11 +1843,15 @@ if args.hp_tuning_program is not None:
     tuning.register_affected_parameter('muon_lr', lambda: optimizer2.param_groups[0]['lr'], set_muon_lr)
     schedule_lr = False
     tuning.register_affected_parameter('wd', lambda: optimizer1.param_groups[0]['weight_decay'], set_wd)
-    tuning.register_affected_parameter('adam_wd', lambda: optimizer1.param_groups[0]['weight_decay'], set_wd)
-    tuning.register_affected_parameter('muon_wd', lambda: optimizer2.param_groups[0]['weight_decay'], set_wd)
-    tuning.register_affected_parameter('betas', lambda: 1/(1-optimizer1.param_groups[0]['betas'][0]), set_betas)
-    tuning.register_affected_parameter('muon_momentum', lambda: 1/(1-optimizer2.param_groups[0]['momentum']), set_muon_momentum)
+    tuning.register_affected_parameter('adam_wd', lambda: optimizer1.param_groups[0]['weight_decay'], set_adam_wd)
+    tuning.register_affected_parameter('muon_wd', lambda: optimizer2.param_groups[0]['weight_decay'], set_muon_wd)
+    tuning.register_affected_parameter('betas', lambda: 1/(1-optimizer1.param_groups[0]['betas'][0]), lambda v: set_betas(1-1/v))
+    tuning.register_affected_parameter('muon_momentum', lambda: 1/(1-optimizer2.param_groups[0]['momentum']), lambda v: set_muon_momentum(1-1/v))
     schedule_muon_momentum = False
+
+scheduling = json.loads(args.scheduling) if args.scheduling is not None else {}
+if args.scheduling is not None:
+    schedule_muon_momentum,schedule_lr = False,False
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
@@ -1865,6 +1889,19 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         momentum = momentum_max
     return momentum
 
+def approximation(schedule:list[tuple[int,float]]) -> float:
+    before = None
+    for stage in schedule:
+        if step >= stage[0]:
+            before = stage
+        elif before is None:
+            return before[1]
+        else:
+            break
+    else:
+        return before[1]
+    return (step-before[0])*(stage[1]-before[1])/(stage[0]-before[0])+before[1]
+
 def step_optimizers(step: int, optimizers, model):
     # update lr
     if schedule_lr:
@@ -1877,6 +1914,12 @@ def step_optimizers(step: int, optimizers, model):
         momentum = get_muon_momentum(step)
         for group in optimizers[1].param_groups:
             group["momentum"] = momentum
+
+    for key,schedule in scheduling.items():
+        scheduling_processors[key](approximation(schedule))
+    if len(scheduling)>0:
+        history and h.capture_config(history, step, hyperparameters = args)
+        history and h.capture_config(history, step, model_params = model_args)
 
     # on even steps, only step Muon params
     # on odd steps, step all params
