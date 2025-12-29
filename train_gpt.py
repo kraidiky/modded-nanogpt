@@ -1535,7 +1535,6 @@ class Hyperparameters:
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40 #40 # number of steps to continue training at final lr and ws
-    num_lr_cooldown_iterations: int = 2275
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
@@ -1552,20 +1551,23 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # Программа автоподбора гиперпараметров
     hp_tuning_program:str = None # None | default, all_params, initial,
-    adam_lr:float = 0.008 * pow(10, -3/5)
-    adam_weight_decay:float = 0.005
-    adam_beta0:float = 0.65
-    muon_lr:float = 0.023 * pow(10, -1/5)
-    muon_momentum:float = 1-1/(1/(1-0.95) * pow(10, -1/5)) # 0.95
-    muon_weight_decay:float = 0.0012559432157547902 # 
+    adam_lr:float = 0.008 #* pow(10, -3/5)
+    adam_weight_decay:float = 0 # 0.005
+    adam_beta0:float = 0.65 # 1-1/(1/(1-0.65) * pow(10, 3/5)) #
+    muon_lr:float = 0.06 # * pow(10, -1/5)
+    muon_momentum:float = 0.95 # 1-1/(1/(1-0.95) * pow(10, -3/5)) # 
+    muon_weight_decay:float = 0.0
     # universal scheduling
     scheduling:str|None = '''{
-        "adam_lr":[[0,0.008],[50,0.005],[200,0.002],[400,0.0008],[600,0.0005],[1000,0.00035],[1400,0.00025],[1450,0.00024],[1500,0.00023],[1800,0.000177],[2000,0.000148],[2200,0.000125],[2400,0.000105]],
-        "muon_lr":[[0,0.055],[50,0.1],[150,0.02],[300,0.008],[400,0.007],[550,0.0058],[750,0.0047],[900,0.004],[1250,0.003],[1600,0.0023],[1950,0.002]],
-        "adam_beta0":[[0,0.65],[100,0.8],[300,0.55],[1600,0.55],[1750,0.8]],
-        "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]],
-        "adam_weight_decay":[[0,0.0031547867224009664],[50,0.0031547867224009673],[100,0.005000000000000002],[150,0.00792446596230557]]
+        "adam_lr":[[0,0.01],[1250,0.01],[2275,0.001]],
+        "muon_lr":[[0,0.075],[1250,0.075],[2275,0.0075]]
     }''' # or None
+    # "adam_weight_decay":[[0,0.0031547867224009664],[50,0.0031547867224009673],[100,0.005000000000000002],[150,0.00792446596230557]]
+    # "adam_lr":[[0,0.008],[50,0.005],[200,0.002],[400,0.0008],[600,0.0005],[1000,0.00035],[1400,0.00025],[1450,0.00024],[1500,0.00023],[1800,0.000177],[2000,0.000148],[2200,0.000125],[2400,0.000105]],
+    # "muon_lr":[[0,0.055],[50,0.1],[150,0.02],[300,0.008],[400,0.007],[550,0.0058],[750,0.0047],[900,0.004],[1250,0.003],[1600,0.0023],[1950,0.002]],
+    # "adam_beta0":[[0,0.65],[100,0.8],[300,0.55],[1600,0.55],[1750,0.8]],
+    # "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]],
+    
 
 @dataclass
 class Modelparameters:
@@ -1855,7 +1857,7 @@ if args.scheduling is not None:
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
-    x = min(0.9999, step / args.num_lr_cooldown_iterations)
+    x = min(0.9999, step / args.num_scheduled_iterations)
     assert 0 <= x < 1
     lr = 1.0
     if x >= 1 - args.cooldown_frac:
