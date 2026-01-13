@@ -1559,8 +1559,8 @@ class Hyperparameters:
     muon_weight_decay:float = 0.0
     # universal scheduling
     scheduling:str|None = '''{
-        "adam_lr_per_loss":[[3.2,0.0008],[3.52,0.008]],
-        "muon_lr_per_loss":[[3.2,0.006],[3.52,0.06]],
+        "adam_lr_per_loss":[[3.2882,0.0008],[3.351,0.003437362637],[3.4164,0.005547252747],[3.52,0.008]],
+        "muon_lr_per_loss":[[3.2882,0.006],[3.351,0.02578021978],[3.4164,0.0416043956],[3.52,0.06]],
         "muon_momentum_per_loss":[[3.2813,0.25],[3.52,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
     }''' # or None
     # "adam_beta0_per_loss":[[3.36,0.8],[3.58,0.95],[3.75,0.8],[6.0,0.75]],
@@ -1572,9 +1572,9 @@ class Hyperparameters:
     # "adam_beta0":[[0,0.65],[100,0.8],[300,0.55],[1600,0.55],[1750,0.8]],
     # "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]]
     # Бейзлайн на момент форка
-    # "adam_lr_per_loss":[[3.2,0.0008],[3.52,0.008]],
-    # "muon_lr_per_loss":[[3.2,0.006],[3.52,0.06]],
-    # "muon_momentum_per_loss":[[3.2813,0.85],[3.294,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
+    # "adam_lr_per_loss":[[3.2882,0.0008],[3.351,0.003437362637],[3.4164,0.005547252747],[3.52,0.008]],
+    # "muon_lr_per_loss":[[3.2882,0.006],[3.351,0.02578021978],[3.4164,0.0416043956],[3.52,0.06]],
+    # "muon_momentum_per_loss":[[3.2813,0.25],[3.52,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
 
 @dataclass
 class Modelparameters:
@@ -2035,7 +2035,7 @@ while True:
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)}ms step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
+        print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)} step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
         history and h.capture_model_state(history, model, start_step)
 
