@@ -19,7 +19,7 @@ from pathlib import Path
 
 import history as h
 
-input_path:str = r"logs/20251224_2110-59ce01ee-5d84-4a08-b9ea-72acb0a6d2bd/last_history.pt"
+input_path:str = r"logs/20260111_2102-baseline/last_history.pt"
 if len(sys.argv) > 1:
     input_path = sys.argv[1]
 parent_path = Path(input_path).parent
@@ -103,6 +103,33 @@ plt.savefig(parent_path/"perplexity.png")
 plt.close('all')
 
 ########## ########## CONFIGURATION ########## ##########
+def SyncTimelines(X: np.ndarray, Y: np.ndarray, X2: np.ndarray) -> np.ndarray:
+    """ Линейная аппроксимация Y для X2 с экстраполяцией крайними значениями.
+    X отсортирован по возрастанию, может содержать повторы. """
+    X,Y,X2 = np.asarray(X), np.asarray(Y), np.asarray(X2)
+    if len(X2) == 0:
+        return np.array([])
+    # Находим позиции для вставки (индексы правых границ)
+    indices = np.searchsorted(X, X2, side='right') - 1
+    # Ограничиваем индексы для интерполяции
+    indices = np.clip(indices, 0, len(X) - 2)
+    # Получаем левые и правые значения X и Y
+    x_left = X[indices]
+    x_right = X[indices + 1]
+    y_left = Y[indices]
+    y_right = Y[indices + 1]
+    # Коэффициенты для линейной интерполяции
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = np.where(x_right != x_left,
+                    (X2 - x_left) / (x_right - x_left),
+                    0)
+    # Линейная интерполяция
+    Y2 = y_left + t * (y_right - y_left)
+    # Экстраполяция: значения за границами X
+    Y2[X2 <= X[0]] = Y[0]      # Меньше или равно минимуму
+    Y2[X2 >= X[-1]] = Y[-1]    # Больше или равно максимуму
+    return Y2
+
 configs = h.get(history, h.keys.config)
 for config_key,values in list(configs.items()):
     if config_key == h.keys.model: ##### Это ключ со структурой модели, хотя логично было бы вынести это в отдельный ключ
@@ -110,17 +137,32 @@ for config_key,values in list(configs.items()):
         pass
     else:
         for key,series in values.items():
-            if not all([item[1] == series[0][1] for item in series]):
-                for scale in ['log','linear']:
+            if not isinstance(series[0][1], str):
+                (parent_path/"log").mkdir(parents=True,exist_ok=True)
+                (parent_path/"per_loss").mkdir(parents=True,exist_ok=True)
+                if not all([item[1] == series[0][1] for item in series]):
                     x = np.array([i for i,v in series])
                     y = np.array([v for i,v in series])
                     plt.plot(x, y, label=f"{y[-1]:.2e} min:{y.min():.2e} max:{y.max():.2e}")
-                    plt.scatter(x,y, c=color_by_id(2), s=9)
+                    #plt.scatter(x,y, c=color_by_id(2), s=9)
                     plt.legend()
                     plt.grid(which='both')
                     plt.title(key)
-                    plt.yscale(scale)
-                    plt.savefig(parent_path/f"{config_key}-{key}-{scale}.png")
+                    plt.savefig(parent_path/f"{config_key}-{key}.png")
+                    plt.yscale("log")
+                    plt.savefig(parent_path/"log"/f"{config_key}-{key}.png")
                     plt.close('all')
+                    # Поставить в соответствие два ряда во втором из которых есть пропуски
+                    plt.plot(SyncTimelines(loss_val[0],loss_val[1],x),y, label=f"{y[-1]:.2e} min:{y.min():.2e} max:{y.max():.2e}")
+                    plt.legend()
+                    plt.grid(which='both')
+                    plt.title(f"{key} / loss")
+                    plt.xlim((plt.xlim()[1],plt.xlim()[0]))
+                    plt.xscale("log")
+                    plt.savefig(parent_path/"per_loss"/f"{config_key}-{key}.png")
+                    plt.close('all')
+                    #if len(x) < 30: print(key, 'per loss', SyncTimelines(loss_val[0], loss_val[1],x),y)
+                else:
+                    print(f'{config_key}/{key}={series[0][1]}')
             else:
-                print(f'{config_key}/{key}={series[0][1]}')
+                print(f'{config_key}/{key}={series}')

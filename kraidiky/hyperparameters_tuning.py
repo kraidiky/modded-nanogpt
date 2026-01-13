@@ -320,11 +320,14 @@ muon_momentum_between = Between(muon_momentum_up, muon_momentum_down, tolerance=
 
 all_params = [adam_lr,muon_lr,betas,muon_momentum,adam_wd,muon_wd,]
 all_grouped_params = [betas,muon_momentum,wd,lr]
-momentums = [betas_between.affectors(), muon_momentum_between.affectors()]
+momentums = [betas,muon_momentum]
+momentums_between = [betas_between.affectors(), muon_momentum_between.affectors()]
+momentums_between = [betas_between.affectors(), muon_momentum_between.affectors()]
 
 programs = {'initial':[all_params+all_params+all_params]+[all_params]*100,
             'all_params':[]+[all_params]*100, # [[]]+ Предполагаем, что на момент запуска цикла инишиал параметры уже подобраны
-            'between':[momentums+momentums+momentums] + [momentums]*100,
+            'between':[momentums_between+momentums_between+momentums_between] + [momentums_between]*100,
+            'momentums':[momentums+momentums+momentums]+[momentums]*100,
             'default':[[lr],
                        [wd],
                        [lr],

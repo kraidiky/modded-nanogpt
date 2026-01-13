@@ -1529,12 +1529,12 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on # 00000*
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 16 * 1 # *8
+    train_batch_size: int = 2048 * 16 * 8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 // 4 # *8
+    val_batch_size: int = 4 * 64 * 1024 * 4 # *8
     # optimization
     num_scheduled_iterations: int = 2275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40 #40 # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 40 # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
@@ -1550,7 +1550,7 @@ class Hyperparameters:
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # Программа автоподбора гиперпараметров
-    hp_tuning_program:str = None # None | default, all_params, initial,
+    hp_tuning_program:str = None # 'momentums' # None | default, all_params, initial,
     adam_lr:float = 0.008 #* pow(10, -3/5)
     adam_weight_decay:float = 0 # 0.005
     adam_beta0:float = 0.65 # 1-1/(1/(1-0.65) * pow(10, 3/5)) #
@@ -1559,15 +1559,22 @@ class Hyperparameters:
     muon_weight_decay:float = 0.0
     # universal scheduling
     scheduling:str|None = '''{
-        "adam_lr":[[0,0.01],[1250,0.01],[2275,0.001]],
-        "muon_lr":[[0,0.075],[1250,0.075],[2275,0.0075]]
+        "adam_lr_per_loss":[[3.2,0.0008],[3.52,0.008]],
+        "muon_lr_per_loss":[[3.2,0.006],[3.52,0.06]],
+        "muon_momentum_per_loss":[[3.2813,0.25],[3.52,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
     }''' # or None
+    # "adam_beta0_per_loss":[[3.36,0.8],[3.58,0.95],[3.75,0.8],[6.0,0.75]],
+    # "muon_momentum_per_loss":[[3.8,0.2],[4.0,0.3],[4.35,0.6],[4.4,0.8],[5.0,0.85]]
+    # Неудачно оптимальный
     # "adam_weight_decay":[[0,0.0031547867224009664],[50,0.0031547867224009673],[100,0.005000000000000002],[150,0.00792446596230557]]
     # "adam_lr":[[0,0.008],[50,0.005],[200,0.002],[400,0.0008],[600,0.0005],[1000,0.00035],[1400,0.00025],[1450,0.00024],[1500,0.00023],[1800,0.000177],[2000,0.000148],[2200,0.000125],[2400,0.000105]],
     # "muon_lr":[[0,0.055],[50,0.1],[150,0.02],[300,0.008],[400,0.007],[550,0.0058],[750,0.0047],[900,0.004],[1250,0.003],[1600,0.0023],[1950,0.002]],
     # "adam_beta0":[[0,0.65],[100,0.8],[300,0.55],[1600,0.55],[1750,0.8]],
-    # "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]],
-    
+    # "muon_momentum":[[0,0.88],[150,0.92],[500,0.88],[800,0.8],[1100,0.7],[1750,0.5]]
+    # Бейзлайн на момент форка
+    # "adam_lr_per_loss":[[3.2,0.0008],[3.52,0.008]],
+    # "muon_lr_per_loss":[[3.2,0.006],[3.52,0.06]],
+    # "muon_momentum_per_loss":[[3.2813,0.85],[3.294,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
 
 @dataclass
 class Modelparameters:
@@ -1804,10 +1811,22 @@ def set_betas(value:float):
 def set_muon_momentum(value:float):
     for p in optimizer2.param_groups: p['momentum'] = value
     args.muon_momentum = value
-scheduling_processors = {'adam_lr':set_adam_lr,'muon_lr':set_muon_lr,
-                         'adam_beta0':set_betas, 'muon_momentum':set_muon_momentum,
-                         'adam_weight_decay':set_adam_wd,'muon_weight_decay':set_muon_wd,
-                         'lr':set_lr, 'wd':set_wd}
+def get_val_loss() -> float:
+    return h.loss_val(history)[-1][1]
+scheduling_processors = {'adam_lr':lambda schedule:set_adam_lr(approximation(schedule,step)),
+                         'muon_lr':lambda schedule:set_muon_lr(approximation(schedule,step)),
+                         'adam_beta0':lambda schedule:set_betas(approximation(schedule,step)),
+                         'muon_momentum':lambda schedule:set_muon_momentum(approximation(schedule,step)),
+                         'adam_weight_decay':lambda schedule:set_adam_wd(approximation(schedule,step)),
+                         'muon_weight_decay':lambda schedule:set_muon_wd(approximation(schedule,step)),
+                         'lr':lambda schedule:set_lr(approximation(schedule,step)),
+                         'wd':lambda schedule:set_wd(approximation(schedule,step)),
+                         'adam_beta0_per_loss':lambda schedule:set_betas(approximation(schedule,get_val_loss())),
+                         'muon_momentum_per_loss':lambda schedule:set_muon_momentum(approximation(schedule,get_val_loss())),
+                         'adam_lr_per_loss':lambda schedule:set_adam_lr(approximation(schedule,get_val_loss())),
+                         'muon_lr_per_loss':lambda schedule:set_muon_lr(approximation(schedule,get_val_loss())),
+                         'muon_momentum_per_loss':lambda schedule:set_muon_momentum(approximation(schedule,get_val_loss())),
+                        }
 
 tuning,schedule_lr, schedule_muon_momentum = None,True,True
 if args.hp_tuning_program is not None:
@@ -1891,18 +1910,18 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         momentum = momentum_max
     return momentum
 
-def approximation(schedule:list[tuple[int,float]]) -> float:
+def approximation(schedule:list[tuple[int,float]], value:float) -> float:
     before = None
     for stage in schedule:
-        if step >= stage[0]:
+        if value >= stage[0]:
             before = stage
         elif before is None:
-            return before[1]
+            return schedule[0][1]
         else:
             break
     else:
         return before[1]
-    return (step-before[0])*(stage[1]-before[1])/(stage[0]-before[0])+before[1]
+    return (value-before[0])*(stage[1]-before[1])/(stage[0]-before[0])+before[1]
 
 def step_optimizers(step: int, optimizers, model):
     # update lr
@@ -1918,7 +1937,7 @@ def step_optimizers(step: int, optimizers, model):
             group["momentum"] = momentum
 
     for key,schedule in scheduling.items():
-        scheduling_processors[key](approximation(schedule))
+        scheduling_processors[key](schedule)
     if len(scheduling)>0:
         history and h.capture_config(history, step, hyperparameters = args)
         history and h.capture_config(history, step, model_params = model_args)
