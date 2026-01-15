@@ -91,6 +91,17 @@ plt.savefig(parent_path/"loss.png")
 plt.close('all')
 print('loss_val:', loss_val)
 
+loss_improvement = (np.array([x1 for x1, x2 in zip(loss_val[0][:-1],loss_val[0][1:]) if x1 != x2]),
+                    np.array([-(l2-l1)/l1 for x1,l1, x2,l2 in zip(loss_val[0][:-1],loss_val[1][:-1],loss_val[0][1:],loss_val[1][1:]) if x1 != x2]))
+plt.plot(loss_improvement[0],loss_improvement[1])
+plt.title('relative loss improvement -Δloss/loss')
+plt.grid(which='both')
+plt.savefig(parent_path/"loss_improvement.png")
+ylim = (np.percentile(loss_improvement[1], 10), np.percentile(loss_improvement[1], 90))
+plt.ylim(min(ylim[0]-.1*(ylim[1]-ylim[0]),0), ylim[1]+.1*(ylim[1]-ylim[0]))
+plt.savefig(parent_path/"loss_improvement_limited.png")
+plt.close('all')
+
 ########## ########## PERPLEXITY ########## ##########
 plt.plot(loss_train[0],[math.exp(l) for l in train] , c=color_by_id(0), label=f'train: {math.exp(loss_train[1][-1]):.3f} min:{math.exp(min(loss_train[1])):.3f}')
 plt.plot(loss_val[0],[math.exp(l) for l in loss_val[1]] , c=color_by_id(4), label=f'val: {math.exp(loss_val[1][-1]):.3f} min:{math.exp(min(loss_val[1])):.3f}')

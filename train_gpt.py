@@ -1539,7 +1539,7 @@ class Hyperparameters:
     cooldown_frac: int = 0.45  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{datetime.now().strftime('%Y%m%d_%H%M')}-{uuid.uuid4()}"
-    val_loss_every: int =  50  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int =  50 # 250 # every how many steps to evaluate val loss? 0 for only at the end
     collect_train_0 = False # Собирать ли трейн loss на первых изученных данных
     collect_train_1 = False # Собирать ли трейн loss на последних изученных данных
     save_checkpoint: bool = False
@@ -1575,6 +1575,9 @@ class Hyperparameters:
     # "adam_lr_per_loss":[[3.2882,0.0008],[3.351,0.003437362637],[3.4164,0.005547252747],[3.52,0.008]],
     # "muon_lr_per_loss":[[3.2882,0.006],[3.351,0.02578021978],[3.4164,0.0416043956],[3.52,0.06]],
     # "muon_momentum_per_loss":[[3.2813,0.25],[3.52,0.95],[4.0273, 0.95],[4.0796, 0.9333333333],[4.1733, 0.9166666667],[4.3146, 0.9],[4.6224, 0.8833333333],[5.2791, 0.8666666667],[10.8258, 0.85]]
+    # Ступенчатый эксперимент
+    # "adam_lr":[[0,0.008],[999,0.008],[1000,0.004],[1999,0.004],[2000,0.002],[2999,0.002],[3000,0.001],[3999,0.001],[4000,0.0005]],
+    # "muon_lr":[[0,0.06],[999,0.06],[1000,0.03],[1999,0.03],[2000,0.015],[2999,0.015],[3000,0.0075],[3999,0.0075],[4000,0.00375]]
 
 @dataclass
 class Modelparameters:
@@ -2037,7 +2040,7 @@ while True:
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{time_to_progress(training_time_ms/1000, step+1, args.num_iterations)} step_avg:{training_time_ms/(step-start_step+1):.2f}ms", console=True)
         history and h.loss_val(history).append((step,val_loss.item()))
-        history and h.capture_model_state(history, model, start_step)
+        history and h.capture_model_state(history, model, step)
 
         if args.collect_train_1: # Собрать loss на train на последних изученных токенах
             assert args.val_batch_size % args.train_batch_size == 0 # предполагаем, что кратное количество просто с соображений оптимизации...

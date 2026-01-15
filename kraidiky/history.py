@@ -46,10 +46,9 @@ def lr(target:dict) -> tuple[list,list]:
     return get(target, keys.lr, factory.list)
 
 def capture_model_state(target, model:torch.nn.Module, t:int):
-    config = get(target, keys.config, factory.dict)
-    if keys.model not in config:
-        config['model'] = [(n,p.shape) for n,p in model.named_parameters()]
     structure = get(target, keys.structure, factory.dict)
+    if keys.model not in structure:
+        structure['model'] = [(n,p.shape) for n,p in model.named_parameters()]
     zeros_per_layer = get(structure, keys.zeros_per_layer, factory.list)
     model_zeros_per_layer = [(p==0).sum().item() for p in model.parameters()]
     if (len(zeros_per_layer) == 0) or (any([p!=n for p,n in zip(zeros_per_layer[-1][1], model_zeros_per_layer)])):
